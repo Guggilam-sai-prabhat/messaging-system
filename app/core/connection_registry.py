@@ -22,30 +22,37 @@ class ConnectionRegistry:
     """
 
     def __init__(self):
-        self._user_connections: dict[str, list[ConnectionInfo]] = {}
+        self._user_connections: dict[str, dict[WebSocket, ConnectionInfo]] = {}
         self._channel_members: dict[str, set[str]] = {}
+        self._ws_to_conn: dict[WebSocket, ConnectionInfo] = {}
 
     # ─── User Connections ─────────────────────────────────────
 
     def add_connection(self, info: ConnectionInfo) -> int:
         """Register a new connection. Returns total active count for user."""
-        conns = self._user_connections.setdefault(info.user_id, [])
-        conns.append(info)
+        conns = self._user_connections.setdefault(info.user_id, {}) 
+        conns[info.websocket] = info
+        self._ws_to_conn[info.websocket] = info
         return len(conns)
 
     def remove_connection(self, websocket: WebSocket) -> ConnectionInfo | None:
-        """Remove by WebSocket identity. Returns removed info or None."""
-        for user_id, connections in self._user_connections.items():
-            for i, conn in enumerate(connections):
-                if conn.websocket is websocket:
-                    removed = connections.pop(i)
-                    if not connections:
-                        del self._user_connections[user_id]
-                    return removed
-        return None
+        conn = self._ws_to_conn.pop(websocket, None)
+        if not conn:
+            return None
+
+        user_conns = self._user_connections.get(conn.user_id)
+        if not user_conns:
+            return conn
+
+        user_conns.pop(websocket, None)
+
+        if not user_conns:
+            del self._user_connections[conn.user_id]
+
+        return conn
 
     def get_user_connections(self, user_id: str) -> list[ConnectionInfo]:
-        return list(self._user_connections.get(user_id, []))
+        return list(self._user_connections.get(user_id, {}).values())
 
     def is_user_online(self, user_id: str) -> bool:
         return bool(self._user_connections.get(user_id))
