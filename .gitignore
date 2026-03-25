@@ -1,10 +1,57 @@
-# Python-generated files
+# Python bytecode / cache
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+*.py[cod]
+*$py.class
 
 # Virtual environments
-.venv
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+generate_keys.py
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs / runtime files
+*.log
+worm_audit/
+brahmx-new-MARCH-17.dump
+# OS artifacts
+.DS_Store
+Thumbs.db
+configuration.json
+CLAUDE.md
+brahmx-new-17.dump
+brahmx-new.dump
+keycloak.dump
+postgres17_all_backup.sql
+skolarx-new.dump
+brahmx-new.dump
+docs1.md
+docs5.md
+documentation.md
+docs.md
