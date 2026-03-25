@@ -1,0 +1,16 @@
+[project]
+name = "messaging-system"
+version = "0.1.0"
+description = "Production-scale messaging system — connection layer"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]",
+    "websockets",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "httpx",
+]
