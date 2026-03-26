@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.routers import health, channels, ws
+from app.core.kafka_producer import kafka_producer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,10 +21,11 @@ logger = logging.getLogger("app")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    kafka_producer.start()
     logger.info("Server starting")
     yield
     logger.info("Server shutting down")
-
+    kafka_producer.shutdown(timeout=10.0)
 
 app = FastAPI(
     title="Messaging System — Connection Layer",

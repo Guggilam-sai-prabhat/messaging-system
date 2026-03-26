@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # Future: Redis URL for multi-process registry
     # redis_url: str = "redis://localhost:6379"
-
+    kafka_bootstrap_servers: str = "localhost:9092"
     model_config = {"env_file": ".env"}
 
 

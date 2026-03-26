@@ -2,6 +2,11 @@
 WebSocket Manager — lifecycle handler for every WS connection.
 
 Orchestrates auth → register → message loop → cleanup.
+
+Changes from v0.1:
+  - message.send now awaits Kafka delivery confirmation
+  - KafkaProduceError handled separately from validation errors
+  - Client gets distinct error types: message.error vs message.kafka_error
 """
 
 import time
@@ -12,6 +17,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from app.core.connection_registry import ConnectionRegistry
 from app.core.auth import authenticate_token
 from app.core.message_ingest import MessageIngestService, MessageValidationError
+from app.core.kafka_producer import KafkaProduceError
 from app.models import ConnectionInfo
 
 logger = logging.getLogger("ws.manager")
@@ -25,17 +31,6 @@ class WebSocketManager:
     async def handle_connection(self, websocket: WebSocket, token: str):
         """Full lifecycle: auth → accept → register → loop → cleanup."""
 
-        # Auth BEFORE accept — reject cheaply.
-        # We must accept() first, THEN close with our custom code.
-        # Why? Starlette doesn't support sending custom WS close codes
-        # during the HTTP handshake phase. If we call close() before
-        # accept(), Starlette sends a raw HTTP 403 — which is fine for
-        # the server, but the client never enters WebSocket protocol
-        # and can't read our 4001 code or reason string.
-        #
-        # The pattern: accept → send error frame → close.
-        # The accept is cheap (~200 bytes), and we close immediately,
-        # so the "wasted" resources are negligible.
         claims = authenticate_token(token)
         if not claims:
             await websocket.accept()
@@ -78,7 +73,7 @@ class WebSocketManager:
             await self._handle_disconnect(websocket, user_id)
 
     async def _message_loop(self, ws: WebSocket, conn: ConnectionInfo):
-        """Process client messages: heartbeat + channel commands."""
+        """Process client messages: heartbeat + channel commands + messages."""
         while True:
             raw = await ws.receive_text()
             try:
@@ -120,19 +115,21 @@ class WebSocketManager:
                 })
 
             elif msg_type == "message.send":
-                # ── MESSAGE INGESTION ─────────────────────────
-                # Validate → enrich → log. NO delivery.
+                # ── MESSAGE INGESTION + KAFKA PRODUCE ─────────
+                # validate → enrich → produce → ack
                 #
-                # Why send_json back to the SENDER only?
-                # This is an acknowledgment ("your message was accepted")
-                # not delivery. The sender needs to know:
-                #   1. The server-assigned messageId (for dedup)
-                #   2. The server timestamp (for ordering)
+                # Two failure modes, two error types:
+                #   1. MessageValidationError → client's fault
+                #      (bad payload, not a member, etc.)
+                #   2. KafkaProduceError → server's fault
+                #      (broker down, timeout, buffer full)
                 #
-                # Delivery to OTHER users happens via Kafka consumer
-                # (not yet implemented). Today we just log.
+                # The client can retry on kafka_error but should
+                # fix its payload on message.error.
                 try:
-                    enriched = self._ingest.validate_and_enrich(msg, conn.user_id)
+                    enriched = await self._ingest.validate_and_enrich(
+                        msg, conn.user_id
+                    )
                     await ws.send_json({
                         "type": "message.ack",
                         "message_id": enriched.message_id,
@@ -143,6 +140,15 @@ class WebSocketManager:
                     await ws.send_json({
                         "type": "message.error",
                         "reason": e.reason,
+                    })
+                except KafkaProduceError as e:
+                    # Log the full error server-side; send a
+                    # generic message to the client (no internals).
+                    logger.error(f"Kafka produce failed: {e}")
+                    await ws.send_json({
+                        "type": "message.kafka_error",
+                        "reason": "Message could not be delivered. Please retry.",
+                        "retryable": True,
                     })
 
             elif msg_type == "reconnect":
