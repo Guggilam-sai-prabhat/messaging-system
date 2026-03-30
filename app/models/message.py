@@ -3,10 +3,15 @@ Message data shapes — the contract between ingest and delivery.
 
 IncomingMessage: what the client sends (minimal, untrusted)
 EnrichedMessage: what the server produces (canonical, Kafka-ready)
+
+Changes in v0.2:
+  - client_request_id: optional dedup key from the client
+  - correlation_id: server-generated trace ID for the full pipeline
 """
 
 import time
 import uuid
+from typing import Optional
 from pydantic import BaseModel, Field
 
 
@@ -28,18 +33,29 @@ class IncomingMessage(BaseModel):
         max_length=4096,
         description="Message body",
     )
+    client_request_id: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Client-generated idempotency key. If the client "
+            "resends after a disconnect, same key = same message. "
+            "Server uses this for application-level dedup."
+        ),
+    )
 
 
 class EnrichedMessage(BaseModel):
-    """Fully enriched message — the Kafka-ready schema.
-
-    Server-generated fields:
-      - message_id: UUID4, globally unique without coordination
-      - timestamp: server clock, not client clock
-      - sender_id: from authenticated connection, never from payload
-    """
+    """Fully enriched message — the Kafka-ready schema."""
     message_id: str = Field(
         default_factory=lambda: str(uuid.uuid4()),
+    )
+    correlation_id: str = Field(
+        default_factory=lambda: str(uuid.uuid4()),
+        description=(
+            "Trace ID for the full pipeline. Appears in every "
+            "log line from receive → produce → ack. Use this "
+            "to grep across services."
+        ),
     )
     channel_id: str
     sender_id: str = Field(
@@ -50,13 +66,21 @@ class EnrichedMessage(BaseModel):
     timestamp: float = Field(
         default_factory=time.time,
     )
+    client_request_id: Optional[str] = Field(
+        default=None,
+        description="Echoed from IncomingMessage for dedup",
+    )
 
-    def to_log_dict(self) -> dict:
-        """Structured log / Kafka payload with camelCase keys."""
-        return {
+    def to_kafka_dict(self) -> dict:
+        """Kafka payload with camelCase keys."""
+        d = {
             "messageId": self.message_id,
+            "correlationId": self.correlation_id,
             "channelId": self.channel_id,
             "senderId": self.sender_id,
             "content": self.content,
             "timestamp": self.timestamp,
         }
+        if self.client_request_id:
+            d["clientRequestId"] = self.client_request_id
+        return d
