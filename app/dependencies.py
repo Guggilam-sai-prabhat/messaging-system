@@ -7,8 +7,7 @@ Why a separate file?
   - Single place to swap in Redis-backed registry later
 """
 
-from app.core.connection_registry import ConnectionRegistry
+from app.core.connection_registry import connection_registry as registry
 from app.core.websocket_manager import WebSocketManager
 
-registry = ConnectionRegistry()
 ws_manager = WebSocketManager(registry)

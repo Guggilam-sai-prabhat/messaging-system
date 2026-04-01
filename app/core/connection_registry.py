@@ -216,3 +216,4 @@ class ConnectionRegistry:
             "local_users": local_users,
             "global_connections": global_connections,
         }
+connection_registry = ConnectionRegistry()
