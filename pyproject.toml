@@ -9,6 +9,7 @@ dependencies = [
     "websockets",
     "confluent-kafka>=2.6.0",
     "pydantic-settings>=2.0.0",
+    "redis>=5.0.0",
 ]
 
 [dependency-groups]

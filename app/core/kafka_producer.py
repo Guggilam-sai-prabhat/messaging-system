@@ -1,10 +1,27 @@
 """
-Kafka Producer — async-safe wrapper with circuit breaker and metrics.
+Kafka Producer — background poller pattern.
 
-Key insight: confluent-kafka's delivery callbacks only fire during
-poll(). poll(0) is non-blocking but may return before the broker
-responds. We run poll(timeout) in a thread executor so it can
-block waiting for the broker WITHOUT freezing the asyncio event loop.
+Previous approach: per-message thread pool for poll().
+  Problem: 4 threads = max 4 concurrent produces. Acks
+  can return out of order. Thread overhead under load.
+
+New approach: ONE background asyncio task calls poll()
+  continuously. produce_message() just calls produce()
+  and awaits a future. The background poller fires
+  callbacks in order as broker responses arrive.
+
+  ┌──────────────────────────────────────────────────┐
+  │  produce_message()    produce_message()    ...   │
+  │       │                    │                     │
+  │       ▼                    ▼                     │
+  │   produce() + future   produce() + future        │
+  │       │                    │                     │
+  │       └────────┬───────────┘                     │
+  │                ▼                                 │
+  │     background_poller task (single loop)         │
+  │       poll(0.1) → fires callbacks → resolves     │
+  │       futures in ORDER                           │
+  └──────────────────────────────────────────────────┘
 """
 
 import json
@@ -12,9 +29,9 @@ import logging
 import asyncio
 import time
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor
 from confluent_kafka import Producer, KafkaException
 
+import threading
 from app.config import settings
 from app.core.circuit_breaker import CircuitBreaker
 from app.core.metrics import ingest_metrics
@@ -41,36 +58,83 @@ class KafkaProducerService:
             recovery_timeout=30.0,
             name="kafka-producer",
         )
-        # Dedicated thread pool for poll() calls.
-        # 4 threads is enough — poll is mostly waiting on I/O,
-        # not doing CPU work.
-        self._poll_executor = ThreadPoolExecutor(
-            max_workers=4, thread_name_prefix="kafka-poll"
-        )
+        self._poller_thread: Optional[threading.Thread] = None
+        self._running = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ── Lifecycle ─────────────────────────────────────────────
 
     def start(self) -> None:
+        """Initialize the producer. Call from lifespan startup."""
         conf = {
             "bootstrap.servers": settings.kafka_bootstrap_servers,
             "acks": "all",
             "enable.idempotence": True,
             "retries": 5,
             "retry.backoff.ms": 100,
-            "linger.ms": 5,
+           
             "batch.size": 32768,
             "compression.type": "lz4",
-            "queue.buffering.max.ms": 1000,
+            
         }
         self._producer = Producer(conf)
+        self._running = True
         logger.info(
             f"Kafka producer started, "
             f"brokers={settings.kafka_bootstrap_servers}"
         )
 
+    def start_poller(self) -> None:
+        """Start the background poll thread.
+
+        A dedicated thread — NOT an asyncio task — because
+        poll() is a blocking C call. Running it in a thread
+        means:
+          1. The event loop is never blocked
+          2. poll() can use longer timeouts (1s) for efficiency
+          3. Callbacks fire the instant the broker responds
+          4. call_soon_threadsafe correctly crosses the
+             thread boundary to resolve futures
+        """
+        self._loop = asyncio.get_running_loop()
+        self._poller_thread = threading.Thread(
+            target=self._poll_loop,
+            name="kafka-poller",
+            daemon=True,
+        )
+        self._poller_thread.start()
+        logger.info("Kafka background poller thread started")
+
+    def _poll_loop(self) -> None:
+        """Runs in a dedicated thread. Blocks on poll(0.5).
+
+        poll(0.5) blocks for up to 500ms. When a broker
+        response arrives, it fires the delivery callback
+        immediately. The callback uses call_soon_threadsafe
+        to resolve the future on the event loop.
+
+        Because this is a real thread (not asyncio), there's
+        zero event loop blocking. The future resolves on the
+        very next event loop iteration after the callback.
+        """
+        while self._running:
+            try:
+                if self._producer:
+                    self._producer.poll(0.05)  # 50ms block max
+            except Exception as e:
+                logger.error(f"Poller error: {e}")
+                time.sleep(1.0)
+
     def shutdown(self, timeout: float = 10.0) -> None:
+        """Stop poller thread, flush remaining messages, tear down."""
+        self._running = False
+
+        if self._poller_thread and self._poller_thread.is_alive():
+            self._poller_thread.join(timeout=2.0)
+
         if not self._producer:
             return
+
         remaining = self._producer.flush(timeout=timeout)
         if remaining > 0:
             logger.error(
@@ -79,11 +143,19 @@ class KafkaProducerService:
         else:
             logger.info("Kafka producer shut down cleanly")
         self._producer = None
-        self._poll_executor.shutdown(wait=False)
 
     # ── Core produce method ───────────────────────────────────
 
     async def produce_message(self, enriched_dict: dict) -> dict:
+        """Produce a message and await delivery confirmation.
+
+        This method is now simple:
+          1. Check circuit breaker
+          2. Call produce() (non-blocking, queues in librdkafka)
+          3. Await the future (background poller resolves it)
+
+        No threads, no executor, no polling here.
+        """
         if not self._producer:
             raise KafkaProduceError("Kafka producer not initialized")
 
@@ -101,27 +173,25 @@ class KafkaProducerService:
         t_start = time.monotonic()
 
         def _on_delivery(err, kafka_msg):
-            """Called by librdkafka during poll() — runs in the
-            poll executor thread, so we use call_soon_threadsafe
-            to resolve the future on the event loop."""
+            """Fired by the background poller's poll() call."""
+            if future.done():
+                return
             if err is not None:
-                if not future.done():
-                    loop.call_soon_threadsafe(
-                        future.set_exception,
-                        KafkaProduceError(
-                            f"Delivery failed: {err.str()}"
-                        ),
-                    )
+                loop.call_soon_threadsafe(
+                    future.set_exception,
+                    KafkaProduceError(
+                        f"Delivery failed: {err.str()}"
+                    ),
+                )
             else:
-                if not future.done():
-                    loop.call_soon_threadsafe(
-                        future.set_result,
-                        {
-                            "topic": kafka_msg.topic(),
-                            "partition": kafka_msg.partition(),
-                            "offset": kafka_msg.offset(),
-                        },
-                    )
+                loop.call_soon_threadsafe(
+                    future.set_result,
+                    {
+                        "topic": kafka_msg.topic(),
+                        "partition": kafka_msg.partition(),
+                        "offset": kafka_msg.offset(),
+                    },
+                )
 
         try:
             self._producer.produce(
@@ -141,53 +211,23 @@ class KafkaProducerService:
             ingest_metrics.record_failed()
             raise KafkaProduceError(f"Produce call failed: {e}")
 
-        # ── Poll in a thread ──────────────────────────────────
-        # This is the critical fix. poll(timeout) blocks the
-        # CALLING thread until a callback fires or timeout
-        # expires. By running it in an executor, the asyncio
-        # event loop stays free to handle other WebSocket
-        # connections.
-        #
-        # Flow:
-        #   1. produce() queues message in librdkafka buffer
-        #   2. librdkafka's background thread sends to broker
-        #   3. broker responds
-        #   4. poll(10) in executor thread processes the
-        #      response and fires _on_delivery
-        #   5. _on_delivery resolves the future via
-        #      call_soon_threadsafe
-        #   6. await future completes on the event loop
-        def _blocking_poll():
-            """Runs in thread pool — safe to block here.
-
-            poll(1.0) blocks up to 1 second waiting for broker
-            responses. It returns the number of callbacks fired
-            in THAT call (often 0 if nothing arrived yet).
-            We loop until the future is resolved or we hit the
-            10s deadline.
-            """
-            deadline = time.monotonic() + 10.0
-            while not future.done() and time.monotonic() < deadline:
-                self._producer.poll(1.0)
-
-        await loop.run_in_executor(self._poll_executor, _blocking_poll)
-
-        # ── Check result ──────────────────────────────────────
-        if not future.done():
+        # ── Await delivery ────────────────────────────────────
+        # The background poller will call poll(), which fires
+        # _on_delivery, which resolves this future.
+        # We just wait here. No threads needed.
+        try:
+            result = await asyncio.wait_for(future, timeout=10.0)
+        except asyncio.TimeoutError:
             self._circuit.record_failure()
             ingest_metrics.record_failed()
             raise KafkaProduceError(
                 "Delivery confirmation timed out (10s)"
             )
-
-        try:
-            result = future.result()
         except KafkaProduceError:
             self._circuit.record_failure()
             ingest_metrics.record_failed()
             raise
 
-        # ── Success ───────────────────────────────────────────
         latency_ms = (time.monotonic() - t_start) * 1000
         self._circuit.record_success()
         ingest_metrics.record_produced(latency_ms)

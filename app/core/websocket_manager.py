@@ -1,10 +1,9 @@
 """
-WebSocket Manager — lifecycle handler with full observability.
+WebSocket Manager — updated for async Redis registry + dedup.
 
-Changes from v0.1:
-  - correlation_id flows from ingest → ack/error response
-  - Three error types: validation, kafka, circuit-open
-  - Structured ack with pipeline timing
+Changes:
+  - Registry calls are now async (Redis-backed)
+  - Ack includes was_dedup flag so client knows if it was a retry
 """
 
 import time
@@ -31,8 +30,6 @@ class WebSocketManager:
         self._ingest = MessageIngestService(registry)
 
     async def handle_connection(self, websocket: WebSocket, token: str):
-        """Full lifecycle: auth → accept → register → loop → cleanup."""
-
         claims = authenticate_token(token)
         if not claims:
             await websocket.accept()
@@ -51,7 +48,7 @@ class WebSocketManager:
             device_id=device_id,
             connected_at=time.time(),
         )
-        active_count = self._registry.add_connection(conn_info)
+        active_count = await self._registry.add_connection(conn_info)
         logger.info(
             f"Connected: user={user_id} device={device_id} "
             f"({active_count} active)"
@@ -104,7 +101,7 @@ class WebSocketManager:
                         "message": "channel_id required",
                     })
                     continue
-                was_new = self._registry.join_channel(
+                was_new = await self._registry.join_channel(
                     ch_id, conn.user_id
                 )
                 await ws.send_json({
@@ -121,7 +118,7 @@ class WebSocketManager:
                         "message": "channel_id required",
                     })
                     continue
-                removed = self._registry.leave_channel(
+                removed = await self._registry.leave_channel(
                     ch_id, conn.user_id
                 )
                 await ws.send_json({
@@ -153,21 +150,11 @@ class WebSocketManager:
     async def _handle_message_send(
         self, ws: WebSocket, msg: dict, conn: ConnectionInfo
     ) -> None:
-        """Handle message.send with three-tier error handling.
-
-        Success → message.ack with correlation_id + timing
-        ValidationError → message.error (client should fix payload)
-        CircuitOpen → message.kafka_error retryable=False
-                      (don't retry immediately, Kafka is down)
-        KafkaProduceError → message.kafka_error retryable=True
-                      (transient, retry with same client_request_id)
-        """
         try:
             result = await self._ingest.validate_and_enrich(
                 msg, conn.user_id
             )
 
-            # ── Success ack ───────────────────────────────────
             ack = {
                 "type": "message.ack",
                 "message_id": result.enriched.message_id,
@@ -175,9 +162,8 @@ class WebSocketManager:
                 "channel_id": result.enriched.channel_id,
                 "timestamp": result.enriched.timestamp,
                 "pipeline_ms": round(result.pipeline_ms, 2),
+                "was_dedup": result.was_dedup,
             }
-            # Echo client_request_id so the client can match
-            # the ack to its local send queue.
             if result.enriched.client_request_id:
                 ack["client_request_id"] = (
                     result.enriched.client_request_id
@@ -201,14 +187,16 @@ class WebSocketManager:
             })
 
         except KafkaCircuitOpenError as e:
-            logger.warning(f"Circuit open for user={conn.user_id}: {e}")
+            logger.warning(
+                f"Circuit open for user={conn.user_id}: {e}"
+            )
             await ws.send_json({
                 "type": "message.kafka_error",
                 "reason": (
                     "Service temporarily unavailable. "
                     "Please retry in a few seconds."
                 ),
-                "retryable": False,  # Don't hammer — wait for cooldown
+                "retryable": False,
             })
 
         except KafkaProduceError as e:
@@ -227,7 +215,7 @@ class WebSocketManager:
     async def _handle_disconnect(
         self, ws: WebSocket, user_id: str
     ) -> None:
-        removed = self._registry.remove_connection(ws)
+        removed = await self._registry.remove_connection(ws)
         if removed:
             remaining = len(
                 self._registry.get_user_connections(user_id)
