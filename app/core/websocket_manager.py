@@ -20,6 +20,7 @@ from app.core.message_ingest import (
 from app.core.kafka_producer import KafkaProduceError, KafkaCircuitOpenError
 from app.core.structred_log import ingest_log
 from app.models import ConnectionInfo
+from app.core.pubsub_subscriber import pubsub_subscriber
 
 logger = logging.getLogger("ws.manager")
 
@@ -49,6 +50,7 @@ class WebSocketManager:
             connected_at=time.time(),
         )
         active_count = await self._registry.add_connection(conn_info)
+        await pubsub_subscriber.subscribe_user(user_id)
         logger.info(
             f"Connected: user={user_id} device={device_id} "
             f"({active_count} active)"
@@ -217,6 +219,7 @@ class WebSocketManager:
     ) -> None:
         removed = await self._registry.remove_connection(ws)
         if removed:
+            await pubsub_subscriber.unsubscribe_user(user_id)
             remaining = len(
                 self._registry.get_user_connections(user_id)
             )

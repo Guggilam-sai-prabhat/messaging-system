@@ -1,15 +1,13 @@
 """
-Application entrypoint — wires routers together.
+Application entrypoint — wires everything together.
 
-Startup order matters:
-  1. Redis first (registry, dedup, delivery all depend on it)
-  2. Kafka producer (needs settings)
-  3. Kafka producer poller (needs running event loop)
-  4. Delivery service consumer (needs registry + event loop)
+Startup order:
+  1. Redis (everything depends on it)
+  2. Pub/Sub subscriber (needs Redis, needs registry)
+  3. Kafka producer + poller
+  4. Delivery consumer (needs registry + event loop)
 
-Shutdown order is reverse. Delivery consumer stops first
-(stops consuming new work), then producer flushes, then
-Redis closes.
+Shutdown is reverse order.
 """
 
 import logging
@@ -20,7 +18,8 @@ from app.routers import health, channels, ws
 from app.core.kafka_producer import kafka_producer
 from app.core.redis_client import redis_client
 from app.core.delivery_service import delivery_service
-from app.dependencies import registry  # the ONE singleton everyone shares
+from app.core.pubsub_subscriber import pubsub_subscriber
+from app.dependencies import registry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,11 +33,13 @@ async def lifespan(app: FastAPI):
     # ── Startup ───────────────────────────────────────────────
     await redis_client.initialize()
 
+    # Pub/Sub subscriber — listens for cross-server deliveries
+    pubsub_subscriber.set_registry(registry)
+    await pubsub_subscriber.start()
+
     kafka_producer.start()
     kafka_producer.start_poller()
 
-    # Delivery service needs the registry to find local
-    # WebSocket connections. Inject it before starting.
     delivery_service.set_registry(registry)
     delivery_service.start()
     delivery_service.start_consumer_thread()
@@ -48,14 +49,15 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────────
     logger.info("Server shutting down")
-    delivery_service.shutdown()     # stop consuming first
+    delivery_service.shutdown()
     kafka_producer.shutdown(timeout=10.0)
+    await pubsub_subscriber.shutdown()
     await redis_client.close()
 
 
 app = FastAPI(
-    title="Messaging System — Connection + Delivery Layer",
-    version="0.4.0",
+    title="Messaging System",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
