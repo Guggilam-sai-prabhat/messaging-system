@@ -1,9 +1,15 @@
 """
-WebSocket Manager — updated for async Redis registry + dedup.
+WebSocket Manager — handles all WebSocket events.
 
-Changes:
-  - Registry calls are now async (Redis-backed)
-  - Ack includes was_dedup flag so client knows if it was a retry
+Events:
+  ping              → pong
+  channel.join      → channel.joined
+  channel.leave     → channel.left
+  message.send      → message.ack
+  messages.history  → messages.history (paginated channel messages)
+  messages.get      → messages.get (single message by ID)
+  channel.stats     → channel.stats (message count + time range)
+  reconnect         → reconnect.ack
 """
 
 import time
@@ -19,8 +25,9 @@ from app.core.message_ingest import (
 )
 from app.core.kafka_producer import KafkaProduceError, KafkaCircuitOpenError
 from app.core.structred_log import ingest_log
-from app.models import ConnectionInfo
+from app.core.message_history import message_history
 from app.core.pubsub_subscriber import pubsub_subscriber
+from app.models import ConnectionInfo
 
 logger = logging.getLogger("ws.manager")
 
@@ -132,6 +139,17 @@ class WebSocketManager:
             elif msg_type == "message.send":
                 await self._handle_message_send(ws, msg, conn)
 
+            # ── History Events ────────────────────────────────
+
+            elif msg_type == "messages.history":
+                await self._handle_messages_history(ws, msg)
+
+            elif msg_type == "messages.get":
+                await self._handle_message_get(ws, msg)
+
+            elif msg_type == "channel.stats":
+                await self._handle_channel_stats(ws, msg)
+
             elif msg_type == "reconnect":
                 last_seen = msg.get("last_event_id")
                 await ws.send_json({
@@ -148,6 +166,8 @@ class WebSocketManager:
                     "type": "error",
                     "message": f"Unknown message type: {msg_type}",
                 })
+
+    # ── Message Send Handler ──────────────────────────────────
 
     async def _handle_message_send(
         self, ws: WebSocket, msg: dict, conn: ConnectionInfo
@@ -213,6 +233,152 @@ class WebSocketManager:
                 ),
                 "retryable": True,
             })
+
+    # ── History Handlers ──────────────────────────────────────
+
+    async def _handle_messages_history(
+        self, ws: WebSocket, msg: dict
+    ) -> None:
+        """Handle messages.history event.
+
+        Client sends:
+          {
+            "type": "messages.history",
+            "channel_id": "general",
+            "limit": 50,            // optional, default 50
+            "before": 1711990000.0, // optional, scroll up
+            "after": 1711989500.0   // optional, catch up
+          }
+
+        Server responds:
+          {
+            "type": "messages.history",
+            "channel_id": "general",
+            "messages": [...],
+            "count": 50,
+            "hasMore": true,
+            "nextCursor": 1711989000.0
+          }
+        """
+        channel_id = msg.get("channel_id")
+        if not channel_id:
+            await ws.send_json({
+                "type": "error",
+                "message": "channel_id required",
+            })
+            return
+
+        try:
+            data = await message_history.get_channel_messages(
+                channel_id=channel_id,
+                limit=msg.get("limit", 50),
+                before=msg.get("before"),
+                after=msg.get("after"),
+            )
+
+            await ws.send_json({
+                "type": "messages.history",
+                "channel_id": channel_id,
+                **data,
+            })
+
+        except Exception as e:
+            logger.error(f"History query failed: {e}")
+            await ws.send_json({
+                "type": "error",
+                "message": "Failed to load message history",
+            })
+
+    async def _handle_message_get(
+        self, ws: WebSocket, msg: dict
+    ) -> None:
+        """Handle messages.get event.
+
+        Client sends:
+          {
+            "type": "messages.get",
+            "channel_id": "general",
+            "message_id": "abc-123"
+          }
+
+        Server responds:
+          {
+            "type": "messages.get",
+            "message": {...} or null
+          }
+        """
+        channel_id = msg.get("channel_id")
+        message_id = msg.get("message_id")
+
+        if not channel_id or not message_id:
+            await ws.send_json({
+                "type": "error",
+                "message": "channel_id and message_id required",
+            })
+            return
+
+        try:
+            data = await message_history.get_message_by_id(
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+
+            await ws.send_json({
+                "type": "messages.get",
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "message": data,
+            })
+
+        except Exception as e:
+            logger.error(f"Message get failed: {e}")
+            await ws.send_json({
+                "type": "error",
+                "message": "Failed to load message",
+            })
+
+    async def _handle_channel_stats(
+        self, ws: WebSocket, msg: dict
+    ) -> None:
+        """Handle channel.stats event.
+
+        Client sends:
+          {"type": "channel.stats", "channel_id": "general"}
+
+        Server responds:
+          {
+            "type": "channel.stats",
+            "channelId": "general",
+            "totalMessages": 1234,
+            "firstMessageAt": 1711000000.0,
+            "lastMessageAt": 1711990000.0
+          }
+        """
+        channel_id = msg.get("channel_id")
+        if not channel_id:
+            await ws.send_json({
+                "type": "error",
+                "message": "channel_id required",
+            })
+            return
+
+        try:
+            data = await message_history.get_channel_stats(
+                channel_id=channel_id
+            )
+            await ws.send_json({
+                "type": "channel.stats",
+                **data,
+            })
+
+        except Exception as e:
+            logger.error(f"Channel stats failed: {e}")
+            await ws.send_json({
+                "type": "error",
+                "message": "Failed to load channel stats",
+            })
+
+    # ── Disconnect Handler ────────────────────────────────────
 
     async def _handle_disconnect(
         self, ws: WebSocket, user_id: str
