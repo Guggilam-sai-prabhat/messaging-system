@@ -13,6 +13,8 @@ Shutdown is reverse order.
 """
 
 import logging
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
@@ -23,6 +25,7 @@ from app.db.database import database
 from app.core.delivery_service import delivery_service
 from app.core.persistence_service import persistence_service
 from app.core.pubsub_subscriber import pubsub_subscriber
+from app.core.presence_service import presence_service
 from app.dependencies import registry
 
 logging.basicConfig(
@@ -35,11 +38,25 @@ logger = logging.getLogger("app")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup ───────────────────────────────────────────────
+    result = subprocess.run(
+        [sys.executable, "scripts/startup.py"],
+        capture_output=True,
+        text=True,
+    )
+    if result.stdout:
+        logger.info(result.stdout.strip())
+    if result.returncode != 0:
+        logger.error(result.stderr.strip())
+        raise RuntimeError("Startup script failed — aborting server start")
+
     await redis_client.initialize()
     await database.initialize()
 
     pubsub_subscriber.set_registry(registry)
     await pubsub_subscriber.start()
+
+    presence_service.set_registry(registry)
+    await presence_service.start()
 
     kafka_producer.start()
     kafka_producer.start_poller()
@@ -59,6 +76,7 @@ async def lifespan(app: FastAPI):
     persistence_service.shutdown()
     delivery_service.shutdown()
     kafka_producer.shutdown(timeout=10.0)
+    await presence_service.shutdown()
     await pubsub_subscriber.shutdown()
     await database.close()
     await redis_client.close()

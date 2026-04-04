@@ -27,6 +27,7 @@ from app.core.kafka_producer import KafkaProduceError, KafkaCircuitOpenError
 from app.core.structred_log import ingest_log
 from app.core.message_history import message_history
 from app.core.pubsub_subscriber import pubsub_subscriber
+from app.core.presence_service import presence_service
 from app.models import ConnectionInfo
 
 logger = logging.getLogger("ws.manager")
@@ -58,6 +59,7 @@ class WebSocketManager:
         )
         active_count = await self._registry.add_connection(conn_info)
         await pubsub_subscriber.subscribe_user(user_id)
+        await presence_service.user_connected(user_id)
         logger.info(
             f"Connected: user={user_id} device={device_id} "
             f"({active_count} active)"
@@ -149,6 +151,14 @@ class WebSocketManager:
 
             elif msg_type == "channel.stats":
                 await self._handle_channel_stats(ws, msg)
+
+            # ── Presence Events ───────────────────────────────
+
+            elif msg_type == "presence.query":
+                await self._handle_presence_query(ws, msg)
+
+            elif msg_type == "presence.channel":
+                await self._handle_channel_presence(ws, msg)
 
             elif msg_type == "reconnect":
                 last_seen = msg.get("last_event_id")
@@ -378,6 +388,98 @@ class WebSocketManager:
                 "message": "Failed to load channel stats",
             })
 
+    # ── Presence Handlers ─────────────────────────────────────
+
+    async def _handle_presence_query(
+        self, ws: WebSocket, msg: dict
+    ) -> None:
+        """Handle presence.query — check if specific users are online.
+
+        Client sends:
+          {
+            "type": "presence.query",
+            "user_ids": ["alice", "bob", "charlie"]
+          }
+
+        Server responds:
+          {
+            "type": "presence.query",
+            "users": {
+              "alice": {"status": "online", ...},
+              "bob": {"status": "offline", "lastSeen": 1711990000},
+              "charlie": {"status": "online", ...}
+            }
+          }
+        """
+        user_ids = msg.get("user_ids", [])
+        if not user_ids:
+            await ws.send_json({
+                "type": "error",
+                "message": "user_ids required",
+            })
+            return
+
+        # Cap at 100 to prevent abuse
+        if len(user_ids) > 100:
+            user_ids = user_ids[:100]
+
+        try:
+            users = {}
+            for uid in user_ids:
+                users[uid] = await presence_service.get_user_presence(uid)
+
+            await ws.send_json({
+                "type": "presence.query",
+                "users": users,
+            })
+        except Exception as e:
+            logger.error(f"Presence query failed: {e}")
+            await ws.send_json({
+                "type": "error",
+                "message": "Failed to query presence",
+            })
+
+    async def _handle_channel_presence(
+        self, ws: WebSocket, msg: dict
+    ) -> None:
+        """Handle presence.channel — who's online in a channel?
+
+        Client sends:
+          {"type": "presence.channel", "channel_id": "general"}
+
+        Server responds:
+          {
+            "type": "presence.channel",
+            "channelId": "general",
+            "online": ["alice", "bob"],
+            "offline": ["charlie"],
+            "onlineCount": 2,
+            "totalMembers": 3
+          }
+        """
+        channel_id = msg.get("channel_id")
+        if not channel_id:
+            await ws.send_json({
+                "type": "error",
+                "message": "channel_id required",
+            })
+            return
+
+        try:
+            data = await presence_service.get_channel_presence(
+                channel_id
+            )
+            await ws.send_json({
+                "type": "presence.channel",
+                **data,
+            })
+        except Exception as e:
+            logger.error(f"Channel presence failed: {e}")
+            await ws.send_json({
+                "type": "error",
+                "message": "Failed to query channel presence",
+            })
+
     # ── Disconnect Handler ────────────────────────────────────
 
     async def _handle_disconnect(
@@ -386,6 +488,7 @@ class WebSocketManager:
         removed = await self._registry.remove_connection(ws)
         if removed:
             await pubsub_subscriber.unsubscribe_user(user_id)
+            await presence_service.user_disconnected(user_id)
             remaining = len(
                 self._registry.get_user_connections(user_id)
             )
