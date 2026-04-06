@@ -19,15 +19,15 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from app.core.connection_registry import ConnectionRegistry
 from app.core.auth import authenticate_token
-from app.core.message_ingest import (
+from app.services.message_ingest import (
     MessageIngestService,
     MessageValidationError,
 )
 from app.core.kafka_producer import KafkaProduceError, KafkaCircuitOpenError
 from app.core.structred_log import ingest_log
-from app.core.message_history import message_history
+from app.services.message_history import message_history
 from app.core.pubsub_subscriber import pubsub_subscriber
-from app.core.presence_service import presence_service
+from app.services.presence_service import presence_service
 from app.models import ConnectionInfo
 
 logger = logging.getLogger("ws.manager")

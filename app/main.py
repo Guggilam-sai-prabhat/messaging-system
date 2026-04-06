@@ -4,12 +4,19 @@ Application entrypoint — wires everything together.
 Startup order:
   1. Redis (registry, dedup, pub/sub depend on it)
   2. PostgreSQL (persistence depends on it)
-  3. Pub/Sub subscriber (needs Redis + registry)
-  4. Kafka producer + poller
-  5. Delivery consumer (needs registry + event loop)
-  6. Persistence consumer (needs DB + event loop)
+  3. Rebuild Redis channel membership from DB
+  4. Pub/Sub subscriber (needs Redis + registry)
+  5. Kafka producer + poller
+  6. Delivery consumer (needs registry + event loop)
+  7. Persistence consumer (needs DB + event loop)
 
 Shutdown is reverse order.
+
+Changes:
+  - membership_service.rebuild_all_channels() at startup
+    populates Redis from the DB so channels created via the
+    new HTTP endpoints are available to the delivery pipeline
+    even after a Redis restart.
 """
 
 import logging
@@ -22,11 +29,11 @@ from app.routers import health, channels, ws, messages
 from app.core.kafka_producer import kafka_producer
 from app.core.redis_client import redis_client
 from app.db.database import database
-from app.core.delivery_service import delivery_service
-from app.core.persistence_service import persistence_service
+from app.services.delivery_service import delivery_service
+from app.services.persistence_service import persistence_service
 from app.core.pubsub_subscriber import pubsub_subscriber
-from app.core.presence_service import presence_service
-from app.dependencies import registry
+from app.services.presence_service import presence_service
+from app.dependencies import registry, membership_service
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +58,15 @@ async def lifespan(app: FastAPI):
 
     await redis_client.initialize()
     await database.initialize()
+
+    # Rebuild Redis channel membership from DB.
+    # This ensures Redis has accurate membership data even after
+    # a Redis flush/restart. Runs with a semaphore (max 10
+    # concurrent DB queries) so it doesn't hammer Postgres.
+    rebuild_counts = await membership_service.rebuild_all_channels()
+    logger.info(
+        f"Rebuilt {len(rebuild_counts)} channel(s) into Redis"
+    )
 
     pubsub_subscriber.set_registry(registry)
     await pubsub_subscriber.start()
@@ -84,7 +100,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Messaging System",
-    version="0.6.0",
+    version="0.7.0",
     lifespan=lifespan,
 )
 

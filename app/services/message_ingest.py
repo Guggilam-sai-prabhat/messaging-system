@@ -2,15 +2,14 @@
 Message Ingestion — validate, dedup, enrich, produce.
 
 Pipeline:
-  receive → validate → DEDUP CHECK → enrich → produce → DEDUP STORE → ack
+  receive → validate → MEMBERSHIP CHECK → DEDUP CHECK → enrich → produce → DEDUP STORE → ack
 
-The dedup step sits between validation and Kafka:
-  - If client_request_id was seen before → return cached result
-  - If new → produce to Kafka, then cache the result
-
-This means a client can safely retry after a disconnect.
-The second attempt returns the same message_id and timestamp
-as the first, and Kafka only has one copy.
+Changes from previous version:
+  - Step 3 (membership) now goes through ChannelMembershipService
+    instead of the raw registry. This gives us the DB fallback
+    when Redis is empty (after flush, restart, sync drift).
+  - Channel existence is also validated — a message to a deleted
+    channel is rejected.
 """
 
 import time
@@ -20,6 +19,7 @@ from pydantic import ValidationError
 
 from app.models import IncomingMessage, EnrichedMessage
 from app.core.connection_registry import ConnectionRegistry
+from app.services.channel_membership_service import ChannelMembershipService
 from app.core.kafka_producer import (
     kafka_producer,
     KafkaProduceError,
@@ -57,9 +57,19 @@ class IngestResult:
 
 
 class MessageIngestService:
+    """
+    Now accepts both a ConnectionRegistry (for other needs)
+    and a ChannelMembershipService (for membership checks
+    with DB fallback).
+    """
 
-    def __init__(self, registry: ConnectionRegistry):
+    def __init__(
+        self,
+        registry: ConnectionRegistry,
+        membership: ChannelMembershipService,
+    ):
         self._registry = registry
+        self._membership = membership
 
     async def validate_and_enrich(
         self, raw: dict, sender_id: str
@@ -97,8 +107,22 @@ class MessageIngestService:
             )
             raise MessageValidationError(reason, correlation_id)
 
-        # ── Step 3: Channel membership ────────────────────────
-        members = await self._registry.get_channel_members(
+        # ── Step 3: Channel membership (WITH DB FALLBACK) ─────
+        #
+        # Previous version:
+        #   members = await self._registry.get_channel_members(...)
+        #
+        # Problem: if Redis is empty (flush, restart, sync bug),
+        # a legitimate member gets rejected.
+        #
+        # New version: ChannelMembershipService.get_members()
+        # tries Redis first, falls back to DB if Redis is empty,
+        # and schedules a background rebuild.
+        #
+        # In the common case (Redis healthy), this is still just
+        # an SMEMBERS call — no extra latency. Only the fallback
+        # path adds ~2-5ms for one DB query.
+        members = await self._membership.get_members(
             incoming.channel_id
         )
         if sender_id not in members:
@@ -123,7 +147,6 @@ class MessageIngestService:
         )
 
         if dedup_result.is_duplicate and dedup_result.cached_data:
-            # Rebuild EnrichedMessage from cached data
             cached = dedup_result.cached_data
             enriched = EnrichedMessage(
                 message_id=cached["messageId"],
@@ -144,7 +167,7 @@ class MessageIngestService:
 
             return IngestResult(
                 enriched=enriched,
-                kafka_partition=-1,  # not produced this time
+                kafka_partition=-1,
                 kafka_offset=-1,
                 pipeline_ms=pipeline_ms,
                 was_dedup=True,
@@ -172,8 +195,6 @@ class MessageIngestService:
             raise
 
         # ── Step 7: Store in dedup cache ──────────────────────
-        # AFTER Kafka confirms. If Kafka fails, we don't cache,
-        # so the client can retry and actually produce.
         await dedup_service.store(
             sender_id,
             incoming.client_request_id,
