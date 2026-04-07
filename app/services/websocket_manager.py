@@ -1,14 +1,29 @@
 """
 WebSocket Manager — handles all WebSocket events.
 
+Changes from previous version:
+  1. Auth: authenticate_token → decode_access_token (JWT)
+     Returns UserClaims dataclass instead of raw dict.
+
+  2. Channel join/leave: registry → channel_service
+     Now writes to DB + Redis instead of Redis-only.
+     This means channels joined via WebSocket are persistent
+     and survive Redis restarts.
+
+  3. Message ingest: passes membership_service for DB fallback
+     on membership checks.
+
+  4. ConnectionInfo: device_id comes from JWT claims, not a
+     separate mock token dict.
+
 Events:
   ping              → pong
   channel.join      → channel.joined
   channel.leave     → channel.left
   message.send      → message.ack
-  messages.history  → messages.history (paginated channel messages)
-  messages.get      → messages.get (single message by ID)
-  channel.stats     → channel.stats (message count + time range)
+  messages.history  → messages.history
+  messages.get      → messages.get
+  channel.stats     → channel.stats
   reconnect         → reconnect.ack
 """
 
@@ -18,7 +33,15 @@ import logging
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.core.connection_registry import ConnectionRegistry
-from app.core.auth import authenticate_token
+from app.core.security import decode_access_token
+from app.services.channel_membership_service import ChannelMembershipService
+from app.services.channel_service import (
+    ChannelService,
+    ChannelServiceError,
+    AlreadyMemberError,
+    NotMemberError,
+    ChannelNotFoundError,
+)
 from app.services.message_ingest import (
     MessageIngestService,
     MessageValidationError,
@@ -34,20 +57,58 @@ logger = logging.getLogger("ws.manager")
 
 
 class WebSocketManager:
-    def __init__(self, registry: ConnectionRegistry):
+    """
+    Constructor now takes all three dependencies:
+      registry          — connection tracking (in-memory + Redis)
+      membership        — Redis membership with DB fallback
+      channel_service   — full channel CRUD (DB + Redis)
+
+    Wired in dependencies.py:
+      ws_manager = WebSocketManager(registry, membership_service, channel_service)
+    """
+
+    def __init__(
+        self,
+        registry: ConnectionRegistry,
+        membership: ChannelMembershipService,
+        channel_service: ChannelService,
+    ):
         self._registry = registry
-        self._ingest = MessageIngestService(registry)
+        self._channel_service = channel_service
+        self._ingest = MessageIngestService(registry, membership)
 
     async def handle_connection(self, websocket: WebSocket, token: str):
-        claims = authenticate_token(token)
-        if not claims:
+        """Authenticate and manage a WebSocket connection.
+
+        Auth flow:
+          1. Decode the JWT access token
+          2. If invalid/expired → close with 4001
+          3. If valid → accept, register, start message loop
+
+        The token comes as a query parameter because browsers
+        can't set custom headers on WebSocket connections:
+          ws://host/ws?token=eyJhbGciOiJIUzI1NiIs...
+
+        Token refresh:
+          Access tokens are short-lived (15 min). The client
+          should refresh via POST /auth/refresh before the
+          token expires and reconnect with the new token.
+
+          We do NOT support mid-connection token refresh over
+          the WebSocket itself. The client disconnects, refreshes
+          via HTTP, and reconnects. This keeps the auth flow
+          stateless and simple.
+        """
+        # ── JWT authentication ────────────────────────────────
+        claims = decode_access_token(token)
+        if claims is None:
             await websocket.accept()
-            await websocket.close(code=4001, reason="Invalid token")
-            logger.warning("Rejected connection: invalid token")
+            await websocket.close(code=4001, reason="Invalid or expired token")
+            logger.warning("Rejected connection: invalid or expired token")
             return
 
-        user_id = claims["user_id"]
-        device_id = claims["device_id"]
+        user_id = claims.user_id
+        device_id = claims.device_id or "unknown"
 
         await websocket.accept()
 
@@ -105,38 +166,10 @@ class WebSocketManager:
                 })
 
             elif msg_type == "channel.join":
-                ch_id = msg.get("channel_id")
-                if not ch_id:
-                    await ws.send_json({
-                        "type": "error",
-                        "message": "channel_id required",
-                    })
-                    continue
-                was_new = await self._registry.join_channel(
-                    ch_id, conn.user_id
-                )
-                await ws.send_json({
-                    "type": "channel.joined",
-                    "channel_id": ch_id,
-                    "was_new": was_new,
-                })
+                await self._handle_channel_join(ws, msg, conn)
 
             elif msg_type == "channel.leave":
-                ch_id = msg.get("channel_id")
-                if not ch_id:
-                    await ws.send_json({
-                        "type": "error",
-                        "message": "channel_id required",
-                    })
-                    continue
-                removed = await self._registry.leave_channel(
-                    ch_id, conn.user_id
-                )
-                await ws.send_json({
-                    "type": "channel.left",
-                    "channel_id": ch_id,
-                    "was_member": removed,
-                })
+                await self._handle_channel_leave(ws, msg, conn)
 
             elif msg_type == "message.send":
                 await self._handle_message_send(ws, msg, conn)
@@ -176,6 +209,87 @@ class WebSocketManager:
                     "type": "error",
                     "message": f"Unknown message type: {msg_type}",
                 })
+
+    # ── Channel Join/Leave ────────────────────────────────────
+    #
+    # These now go through channel_service (DB + Redis) instead
+    # of the raw registry (Redis-only). This means:
+    #   - Joins persist to the channel_members table
+    #   - Channel existence is verified
+    #   - Deleted channels are rejected
+    #   - Duplicate joins return a clear error
+
+    async def _handle_channel_join(
+        self, ws: WebSocket, msg: dict, conn: ConnectionInfo
+    ) -> None:
+        ch_id = msg.get("channel_id")
+        if not ch_id:
+            await ws.send_json({
+                "type": "error",
+                "message": "channel_id required",
+            })
+            return
+
+        try:
+            result = await self._channel_service.join_channel(
+                ch_id, conn.user_id
+            )
+            await ws.send_json({
+                "type": "channel.joined",
+                "channel_id": ch_id,
+                "role": result.get("role", "member"),
+            })
+        except AlreadyMemberError:
+            # Not an error from the client's perspective —
+            # they might be reconnecting and re-joining.
+            # Return success with a hint that they were
+            # already a member.
+            await ws.send_json({
+                "type": "channel.joined",
+                "channel_id": ch_id,
+                "was_already_member": True,
+            })
+        except ChannelNotFoundError:
+            await ws.send_json({
+                "type": "error",
+                "message": f"Channel '{ch_id}' not found",
+            })
+        except ChannelServiceError as e:
+            await ws.send_json({
+                "type": "error",
+                "message": e.message,
+            })
+
+    async def _handle_channel_leave(
+        self, ws: WebSocket, msg: dict, conn: ConnectionInfo
+    ) -> None:
+        ch_id = msg.get("channel_id")
+        if not ch_id:
+            await ws.send_json({
+                "type": "error",
+                "message": "channel_id required",
+            })
+            return
+
+        try:
+            await self._channel_service.leave_channel(
+                ch_id, conn.user_id
+            )
+            await ws.send_json({
+                "type": "channel.left",
+                "channel_id": ch_id,
+            })
+        except NotMemberError:
+            await ws.send_json({
+                "type": "channel.left",
+                "channel_id": ch_id,
+                "was_member": False,
+            })
+        except ChannelServiceError as e:
+            await ws.send_json({
+                "type": "error",
+                "message": e.message,
+            })
 
     # ── Message Send Handler ──────────────────────────────────
 
@@ -249,27 +363,6 @@ class WebSocketManager:
     async def _handle_messages_history(
         self, ws: WebSocket, msg: dict
     ) -> None:
-        """Handle messages.history event.
-
-        Client sends:
-          {
-            "type": "messages.history",
-            "channel_id": "general",
-            "limit": 50,            // optional, default 50
-            "before": 1711990000.0, // optional, scroll up
-            "after": 1711989500.0   // optional, catch up
-          }
-
-        Server responds:
-          {
-            "type": "messages.history",
-            "channel_id": "general",
-            "messages": [...],
-            "count": 50,
-            "hasMore": true,
-            "nextCursor": 1711989000.0
-          }
-        """
         channel_id = msg.get("channel_id")
         if not channel_id:
             await ws.send_json({
@@ -302,21 +395,6 @@ class WebSocketManager:
     async def _handle_message_get(
         self, ws: WebSocket, msg: dict
     ) -> None:
-        """Handle messages.get event.
-
-        Client sends:
-          {
-            "type": "messages.get",
-            "channel_id": "general",
-            "message_id": "abc-123"
-          }
-
-        Server responds:
-          {
-            "type": "messages.get",
-            "message": {...} or null
-          }
-        """
         channel_id = msg.get("channel_id")
         message_id = msg.get("message_id")
 
@@ -350,20 +428,6 @@ class WebSocketManager:
     async def _handle_channel_stats(
         self, ws: WebSocket, msg: dict
     ) -> None:
-        """Handle channel.stats event.
-
-        Client sends:
-          {"type": "channel.stats", "channel_id": "general"}
-
-        Server responds:
-          {
-            "type": "channel.stats",
-            "channelId": "general",
-            "totalMessages": 1234,
-            "firstMessageAt": 1711000000.0,
-            "lastMessageAt": 1711990000.0
-          }
-        """
         channel_id = msg.get("channel_id")
         if not channel_id:
             await ws.send_json({
@@ -393,24 +457,6 @@ class WebSocketManager:
     async def _handle_presence_query(
         self, ws: WebSocket, msg: dict
     ) -> None:
-        """Handle presence.query — check if specific users are online.
-
-        Client sends:
-          {
-            "type": "presence.query",
-            "user_ids": ["alice", "bob", "charlie"]
-          }
-
-        Server responds:
-          {
-            "type": "presence.query",
-            "users": {
-              "alice": {"status": "online", ...},
-              "bob": {"status": "offline", "lastSeen": 1711990000},
-              "charlie": {"status": "online", ...}
-            }
-          }
-        """
         user_ids = msg.get("user_ids", [])
         if not user_ids:
             await ws.send_json({
@@ -419,7 +465,6 @@ class WebSocketManager:
             })
             return
 
-        # Cap at 100 to prevent abuse
         if len(user_ids) > 100:
             user_ids = user_ids[:100]
 
@@ -442,21 +487,6 @@ class WebSocketManager:
     async def _handle_channel_presence(
         self, ws: WebSocket, msg: dict
     ) -> None:
-        """Handle presence.channel — who's online in a channel?
-
-        Client sends:
-          {"type": "presence.channel", "channel_id": "general"}
-
-        Server responds:
-          {
-            "type": "presence.channel",
-            "channelId": "general",
-            "online": ["alice", "bob"],
-            "offline": ["charlie"],
-            "onlineCount": 2,
-            "totalMembers": 3
-          }
-        """
         channel_id = msg.get("channel_id")
         if not channel_id:
             await ws.send_json({

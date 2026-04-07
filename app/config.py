@@ -17,6 +17,22 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+
+    jwt_secret_key:  str = "your-256-bit-random-secret-here"
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 15
+    refresh_token_expire_days: int = 7
+
+    # ── OAuth: Google ─────────────────────────────────────────
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = "http://localhost:8000/auth/google/callback"
+
+    # ── OAuth: GitHub ─────────────────────────────────────────
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    github_redirect_uri: str = "http://localhost:8000/auth/github/callback"
+
     # Future: Redis URL for multi-process registry
     # redis_url: str = "redis://localhost:6379"
     kafka_bootstrap_servers: str = "localhost:9092"

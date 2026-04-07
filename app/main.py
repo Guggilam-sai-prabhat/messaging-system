@@ -25,7 +25,7 @@ import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
-from app.routers import health, channels, ws, messages
+from app.routers import health, channels, ws, messages, auth
 from app.core.kafka_producer import kafka_producer
 from app.core.redis_client import redis_client
 from app.db.database import database
@@ -104,6 +104,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(auth.router)
 app.include_router(health.router)
 app.include_router(channels.router)
 app.include_router(ws.router)
