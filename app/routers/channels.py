@@ -121,6 +121,18 @@ async def list_channels(
     return await channel_service.list_user_channels(user_id)
 
 
+@router.get("/browse")
+async def browse_channels(
+    user_id: str = Depends(get_current_user),
+):
+    """List all active channels so new users can discover what to join.
+
+    Returns every non-deleted channel with member count and an
+    `isMember` flag so the client knows whether to show Join or Joined.
+    """
+    return await channel_service.browse_all_channels(user_id)
+
+
 @router.get("/{channel_id}")
 async def get_channel(
     channel_id: str,

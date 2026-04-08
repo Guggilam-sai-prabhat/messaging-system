@@ -14,10 +14,9 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select, func, and_
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import database
-from app.db.models import Message
+from app.db.models import Message, User
 
 logger = logging.getLogger("history")
 
@@ -51,7 +50,17 @@ class MessageHistoryService:
 
         async with database.get_session() as session:
             query = (
-                select(Message)
+                select(
+                    Message.message_id,
+                    Message.channel_id,
+                    Message.sender_id,
+                    Message.content,
+                    Message.created_at,
+                    Message.correlation_id,
+                    Message.client_request_id,
+                    User.display_name,
+                )
+                .join(User, User.user_id == Message.sender_id)
                 .where(Message.channel_id == channel_id)
             )
 
@@ -77,7 +86,7 @@ class MessageHistoryService:
             query = query.limit(limit + 1)
 
             result = await session.execute(query)
-            rows = list(result.scalars().all())
+            rows = list(result.all())
 
         has_more = len(rows) > limit
         if has_more:
@@ -107,14 +116,27 @@ class MessageHistoryService:
     ) -> Optional[dict]:
         """Fetch a single message."""
         async with database.get_session() as session:
-            query = select(Message).where(
-                and_(
-                    Message.message_id == message_id,
-                    Message.channel_id == channel_id,
+            query = (
+                select(
+                    Message.message_id,
+                    Message.channel_id,
+                    Message.sender_id,
+                    Message.content,
+                    Message.created_at,
+                    Message.correlation_id,
+                    Message.client_request_id,
+                    User.display_name,
+                )
+                .join(User, User.user_id == Message.sender_id)
+                .where(
+                    and_(
+                        Message.message_id == message_id,
+                        Message.channel_id == channel_id,
+                    )
                 )
             )
             result = await session.execute(query)
-            row = result.scalar_one_or_none()
+            row = result.one_or_none()
 
             if not row:
                 return None
@@ -140,12 +162,13 @@ class MessageHistoryService:
                 "lastMessageAt": last_at.timestamp() if last_at else None,
             }
 
-    def _row_to_dict(self, row: Message) -> dict:
+    def _row_to_dict(self, row) -> dict:
         """Convert to camelCase dict matching WebSocket format."""
         return {
             "messageId": row.message_id,
             "channelId": row.channel_id,
             "senderId": row.sender_id,
+            "displayName": row.display_name,
             "content": row.content,
             "timestamp": row.created_at.timestamp(),
             "correlationId": row.correlation_id,

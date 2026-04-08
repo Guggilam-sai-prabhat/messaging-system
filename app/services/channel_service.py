@@ -353,6 +353,50 @@ class ChannelService:
             ]
 
     # ─────────────────────────────────────────────────────────
+    # Browse all channels (discovery for new users)
+    # ─────────────────────────────────────────────────────────
+
+    async def browse_all_channels(self, user_id: str) -> list[dict]:
+        """Return all active channels so new users can discover and join.
+
+        Includes member count and whether the calling user is already
+        a member, so the client can show a Join/Joined button.
+        """
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                text("""
+                    SELECT
+                        c.channel_id,
+                        c.name,
+                        c.description,
+                        c.created_by,
+                        c.created_at,
+                        COUNT(cm.user_id) AS member_count,
+                        BOOL_OR(cm.user_id = :uid) AS is_member
+                    FROM channels c
+                    LEFT JOIN channel_members cm
+                        ON cm.channel_id = c.channel_id
+                    WHERE c.is_deleted = false
+                    GROUP BY c.channel_id, c.name, c.description,
+                             c.created_by, c.created_at
+                    ORDER BY c.created_at DESC
+                """),
+                {"uid": user_id},
+            )
+            return [
+                {
+                    "channelId": r.channel_id,
+                    "name": r.name,
+                    "description": r.description,
+                    "createdBy": r.created_by,
+                    "createdAt": r.created_at.isoformat(),
+                    "memberCount": r.member_count,
+                    "isMember": r.is_member,
+                }
+                for r in rows.fetchall()
+            ]
+
+    # ─────────────────────────────────────────────────────────
     # Get single channel info
     # ─────────────────────────────────────────────────────────
 

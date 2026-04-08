@@ -37,10 +37,9 @@ from fastapi import APIRouter, Query, HTTPException
 from pydantic import BaseModel
 
 from sqlalchemy import select, func, and_
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import database
-from app.db.models import Message
+from app.db.models import Message, User
 
 logger = logging.getLogger("api.messages")
 router = APIRouter(prefix="/channels", tags=["messages"])
@@ -58,6 +57,7 @@ class MessageResponse(BaseModel):
     messageId: str
     channelId: str
     senderId: str
+    displayName: str
     content: str
     timestamp: float
     correlationId: Optional[str] = None
@@ -86,12 +86,13 @@ class ChannelStatsResponse(BaseModel):
 
 # ── Helper ────────────────────────────────────────────────────
 
-def row_to_response(row: Message) -> MessageResponse:
-    """Convert a SQLAlchemy Message row to API response."""
+def row_to_response(row) -> MessageResponse:
+    """Convert a query row (message + display_name) to API response."""
     return MessageResponse(
         messageId=row.message_id,
         channelId=row.channel_id,
         senderId=row.sender_id,
+        displayName=row.display_name,
         content=row.content,
         timestamp=row.created_at.timestamp(),
         correlationId=row.correlation_id,
@@ -145,9 +146,19 @@ async def get_channel_messages(
     to load the next page of older messages.
     """
     async with database.get_session() as session:
-        # Build query
-        query = (
-            select(Message)
+        # Build base query — JOIN users to get display_name
+        base_query = (
+            select(
+                Message.message_id,
+                Message.channel_id,
+                Message.sender_id,
+                Message.content,
+                Message.created_at,
+                Message.correlation_id,
+                Message.client_request_id,
+                User.display_name,
+            )
+            .join(User, User.user_id == Message.sender_id)
             .where(Message.channel_id == channel_id)
         )
 
@@ -155,26 +166,26 @@ async def get_channel_messages(
             before_dt = datetime.fromtimestamp(
                 before, tz=timezone.utc
             )
-            query = query.where(Message.created_at < before_dt)
+            base_query = base_query.where(Message.created_at < before_dt)
 
         if after is not None:
             after_dt = datetime.fromtimestamp(
                 after, tz=timezone.utc
             )
-            query = query.where(Message.created_at > after_dt)
+            base_query = base_query.where(Message.created_at > after_dt)
 
         # Order: newest first for "before" (scrolling up),
         # oldest first for "after" (catching up)
         if after is not None:
-            query = query.order_by(Message.created_at.asc())
+            base_query = base_query.order_by(Message.created_at.asc())
         else:
-            query = query.order_by(Message.created_at.desc())
+            base_query = base_query.order_by(Message.created_at.desc())
 
         # Fetch one extra to determine hasMore
-        query = query.limit(limit + 1)
+        base_query = base_query.limit(limit + 1)
 
-        result = await session.execute(query)
-        rows = list(result.scalars().all())
+        result = await session.execute(base_query)
+        rows = list(result.all())
 
         has_more = len(rows) > limit
         if has_more:
@@ -215,14 +226,27 @@ async def get_message_by_id(channel_id: str, message_id: str):
     or verifying a message was persisted.
     """
     async with database.get_session() as session:
-        query = select(Message).where(
-            and_(
-                Message.message_id == message_id,
-                Message.channel_id == channel_id,
+        query = (
+            select(
+                Message.message_id,
+                Message.channel_id,
+                Message.sender_id,
+                Message.content,
+                Message.created_at,
+                Message.correlation_id,
+                Message.client_request_id,
+                User.display_name,
+            )
+            .join(User, User.user_id == Message.sender_id)
+            .where(
+                and_(
+                    Message.message_id == message_id,
+                    Message.channel_id == channel_id,
+                )
             )
         )
         result = await session.execute(query)
-        row = result.scalar_one_or_none()
+        row = result.one_or_none()
 
         if not row:
             raise HTTPException(
