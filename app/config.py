@@ -42,5 +42,12 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:new_password@localhost:5432/messaging"
     model_config = {"env_file": ".env"}
 
+    # ── MinIO / S3 ────────────────────────────────────────────
+    minio_endpoint: str = "localhost:9000"
+    minio_access_key: str = "minioadmin"
+    minio_secret_key: str = "minioadmin"
+    minio_bucket: str = "documents"
+    minio_use_ssl: bool = False
+
 
 settings = Settings()

@@ -35,6 +35,7 @@ from app.services.persistence_service import persistence_service
 from app.core.pubsub_subscriber import pubsub_subscriber
 from app.services.presence_service import presence_service
 from app.dependencies import registry, membership_service
+from app.dependencies import storage_service
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,6 +86,8 @@ async def lifespan(app: FastAPI):
     persistence_service.start()
     persistence_service.start_consumer_thread()
 
+    await storage_service.initialize() 
+
     logger.info("Server ready")
     yield
 
@@ -118,3 +121,4 @@ app.include_router(health.router)
 app.include_router(channels.router)
 app.include_router(ws.router)
 app.include_router(messages.router)
+

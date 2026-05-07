@@ -14,6 +14,7 @@ from app.services.websocket_manager import WebSocketManager
 from app.services.channel_membership_service import ChannelMembershipService
 from app.services.channel_service import ChannelService
 from app.services.auth_service import AuthService
+from app.services.storage_service import StorageService
 from app.db.database import database
 
 membership_service = ChannelMembershipService(registry)
@@ -32,3 +33,5 @@ ws_manager = WebSocketManager(
 auth_service = AuthService(
     session_factory=database.get_session,
 )
+
+storage_service = StorageService()

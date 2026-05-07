@@ -17,6 +17,7 @@ dependencies = [
     "pyjwt>=2.12.1",
     "bcrypt>=5.0.0",
     "pydantic[email]>=2.12.5",
+    "minio>=7.2.20",
 ]
 
 [dependency-groups]
