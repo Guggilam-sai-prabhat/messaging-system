@@ -26,6 +26,16 @@ TOPICS: list[dict] = [
         "num_partitions": 3,
         "replication_factor": 1,
     },
+    {
+        # Document processing events. Separate topic from channel-messages
+        # so the document consumer scales independently and can have its
+        # own retention policy (longer — documents may need reprocessing).
+        # num_partitions=3 matches channel-messages so load is spread
+        # evenly across brokers; increase if document upload volume grows.
+        "name": "document-processing",
+        "num_partitions": 3,
+        "replication_factor": 1,
+    },
 ]
 
 

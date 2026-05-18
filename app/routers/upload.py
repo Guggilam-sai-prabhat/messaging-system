@@ -1,4 +1,4 @@
-# routers/upload.py
+# app/routers/upload.py
 
 """
 PDF upload endpoint.
@@ -8,22 +8,55 @@ Flow:
   2. Membership check (is user in channel?)
   3. File validation (type, size, not empty, actually a PDF)
   4. Stream to MinIO + compute hash
-  5. Insert DB row (status=processing)
-  6. Return 202 + document metadata
-  7. (Later) Kafka event triggers async processing
+  5. Insert DB row (status='processing')
+  6. Emit Kafka event → async consumer handles extraction/indexing
+  7. Return 202 + document metadata
 
-Validation order matters:
-  We check membership BEFORE reading the file body. If the
-  user isn't in the channel, we reject immediately without
-  wasting I/O on a file we'll throw away. Same principle as
-  your channel routes — fail fast, fail cheap.
+─── Why async document processing? ──────────────────────────────
+PDF text extraction, OCR, and embedding generation are CPU/IO-bound
+and can take 5–30 seconds per document. Doing that work inside this
+request handler blocks an entire HTTP worker for every concurrent
+upload. Emitting a Kafka event and returning 202 immediately keeps
+the handler fast and lets the heavy lifting scale independently.
 
-Why 202 and not 201?
-  201 means "the resource is fully created and ready."
-  202 means "accepted for processing." Since we return while
-  processing is still pending, 202 is semantically correct.
-  The client should poll GET /documents/{id} or listen for
-  a WebSocket event to know when it's ready.
+─── Why Kafka over a simple task queue (Celery/Redis)? ──────────
+  Durability    — Messages are written to disk and replicated.
+                  A broker restart loses nothing.
+  Replayability — If the consumer crashes mid-processing, the Kafka
+                  offset hasn't been committed, so the event is
+                  redelivered automatically on restart. With
+                  Celery/Redis the job vanishes the moment it's
+                  dequeued and before it's ack'd.
+  Decoupling    — New consumers (thumbnail generator, virus scanner)
+                  subscribe without any change here.
+
+─── Kafka failure handling ───────────────────────────────────────
+produce_document_event retries up to 3 times internally (0.5s/1.0s
+backoff) for transient errors. By the time an exception reaches this
+handler, either:
+  a) All 3 retries were exhausted (genuine broker problem), or
+  b) The circuit breaker was open (sustained outage)
+
+In both cases we log at WARNING and return 202 anyway. The document
+row is already committed to the DB at status='processing'. The
+APScheduler reconciliation job (runs every 5 minutes) will find it
+and re-enqueue it. The user polls GET /documents/{id}/status and
+eventually sees 'completed' — they never need to know a retry happened.
+
+We NEVER roll back the DB insert on Kafka failure. The row in DB
+is safe and idempotent. Kafka failure is the only partial-failure
+mode and it is fully recoverable.
+
+─── Validation order ─────────────────────────────────────────────
+Membership is checked BEFORE reading the file body. If the user
+isn't in the channel we reject immediately without wasting I/O on
+a file we'll discard anyway.
+
+─── Why 202 and not 201? ─────────────────────────────────────────
+201 = "resource fully created and ready."
+202 = "accepted for processing." Since the document isn't queryable
+until the consumer finishes, 202 is semantically correct. Clients
+should poll GET /documents/{id}/status to know when it's ready.
 """
 
 import uuid
@@ -32,6 +65,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy import text
 
 from app.core.auth import get_current_user
+from app.core.kafka_producer import kafka_producer, KafkaProduceError
 from app.dependencies import membership_service, storage_service
 from app.db.database import database
 from app.services.storage_service import StorageError
@@ -67,8 +101,7 @@ def _validate_content_type(upload: UploadFile) -> None:
             status_code=415,
             detail={
                 "error": "INVALID_FILE_TYPE",
-                "message": f"Expected application/pdf, "
-                           f"got {upload.content_type}.",
+                "message": f"Expected application/pdf, got {upload.content_type}.",
             },
         )
 
@@ -77,8 +110,9 @@ async def _validate_pdf_magic(upload: UploadFile) -> None:
     """Read first 4 bytes to confirm it's actually a PDF.
 
     Clients can lie about Content-Type. A renamed .exe with
-    content_type=application/pdf passes the MIME check but
-    fails here. We read 4 bytes, check, then seek back.
+    content_type=application/pdf passes the MIME check but fails
+    here. We read 4 bytes, check, then seek back so the storage
+    service receives the full file.
     """
     header = await upload.read(4)
     if len(header) < 4:
@@ -98,7 +132,6 @@ async def _validate_pdf_magic(upload: UploadFile) -> None:
                            "(missing %PDF header).",
             },
         )
-    # Seek back so the storage service gets the full file.
     await upload.seek(0)
 
 
@@ -107,8 +140,8 @@ async def _validate_file_size(upload: UploadFile) -> None:
 
     UploadFile.size may be None if the client didn't send
     Content-Length (chunked transfer). In that case we can't
-    pre-check — the storage layer will enforce the limit
-    during streaming. But when available, fail fast.
+    pre-check — the storage layer enforces the limit during
+    streaming. When available, fail fast here.
     """
     if upload.size is not None and upload.size > MAX_FILE_SIZE:
         raise HTTPException(
@@ -140,9 +173,9 @@ async def upload_document(
 ):
     """Upload a PDF to a channel.
 
-    Returns 202 with document metadata. The document starts
-    in 'processing' status — a background consumer handles
-    text extraction, indexing, etc.
+    Returns 202 with document metadata. The document starts at
+    status='processing'. Poll GET /documents/{documentId}/status
+    until status becomes 'completed' or 'failed'.
     """
     # ── 1. Membership check (cheap — hits Redis) ──────────
     await _check_membership(channel_id, user_id)
@@ -172,8 +205,8 @@ async def upload_document(
         )
 
     # ── 4. Size check (streaming case) ────────────────────
-    # If Content-Length wasn't sent, we didn't know size
-    # until after writing. Check now and clean up if too big.
+    # Content-Length not sent → we only know the real size after
+    # writing. Clean up the object if it's over the limit.
     if size_bytes > MAX_FILE_SIZE:
         await storage_service.delete_file(object_key)
         raise HTTPException(
@@ -235,7 +268,6 @@ async def upload_document(
                                "to this channel.",
                 },
             )
-        # Unknown DB error — clean up the orphaned object
         await storage_service.delete_file(object_key)
         logger.error(f"DB insert failed for document {document_id}: {e}")
         raise HTTPException(
@@ -246,14 +278,40 @@ async def upload_document(
             },
         )
 
-    # ── 6. TODO: Emit Kafka event for async processing ────
-    # await kafka_producer.produce_message({
-    #     "type": "document.uploaded",
-    #     "documentId": document_id,
-    #     "channelId": channel_id,
-    #     "storagePath": object_key,
-    #     "uploadedBy": user_id,
-    # })
+    # ── 6. Emit Kafka event for async processing ──────────
+    #
+    # DB commit must succeed before this call. The consumer will
+    # immediately SELECT the document row by ID — if Kafka fires
+    # before the commit, the consumer finds nothing.
+    #
+    # produce_document_event handles its own retries (3 attempts,
+    # 0.5s/1.0s backoff). By the time an exception reaches here,
+    # either all retries failed or the circuit breaker was open —
+    # both mean a genuine broker problem, not a transient blip.
+    #
+    # Recovery: the APScheduler reconciliation job runs every 5
+    # minutes and re-enqueues any document stuck at 'processing'
+    # for more than 10 minutes. The user polling
+    # GET /documents/{documentId}/status will eventually see
+    # 'completed' without ever knowing a retry happened.
+    try:
+        await kafka_producer.produce_document_event(
+            {
+                "documentId": document_id,
+                "channelId": channel_id,
+                "storagePath": object_key,
+                "uploadedBy": user_id,
+            }
+        )
+    except KafkaProduceError as e:
+        # Upload succeeded — don't punish the user for a broker issue.
+        # WARNING not ERROR: the upload itself is fine, only the async
+        # processing trigger failed. Do NOT re-raise. Do NOT delete the
+        # DB row.
+        logger.warning(
+            f"Kafka publish failed for document {document_id} after all "
+            f"retries: {e}. Reconciliation job will re-enqueue."
+        )
 
     return {
         "documentId": document_id,

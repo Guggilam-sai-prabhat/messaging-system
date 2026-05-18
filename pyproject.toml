@@ -18,6 +18,7 @@ dependencies = [
     "bcrypt>=5.0.0",
     "pydantic[email]>=2.12.5",
     "minio>=7.2.20",
+    "apscheduler>=3.11.2",
 ]
 
 [dependency-groups]
