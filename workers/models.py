@@ -17,3 +17,5 @@ class ExtractionResult:
     text: str
     page_count: int
     truncated: bool         # True if MAX_PAGES was hit
+    empty_pages: list[int]  # 1-based page numbers that yielded no text
+    content_hash: str       # SHA-256 of cleaned text
