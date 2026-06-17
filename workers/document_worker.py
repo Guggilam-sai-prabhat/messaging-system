@@ -17,6 +17,9 @@ from workers.config import (
     KAFKA_TOPIC,
     MAX_PAGES,
 )
+from workers.chunk_repository import ChunkRepository
+from workers.chunker import split_text
+from workers.embedder import Embedder
 from workers.extractor import PDFExtractor
 from workers.models import DocumentEvent, ExtractionResult
 from workers.repository import DocumentRepository
@@ -51,6 +54,8 @@ class DocumentWorker:
         self._consumer: Consumer
         self._storage = StorageClient()
         self._repo: DocumentRepository
+        self._chunk_repo: ChunkRepository
+        self._embedder = Embedder()
         self._running = False
         self._db_engine = None
         self._session_factory: async_sessionmaker
@@ -78,6 +83,7 @@ class DocumentWorker:
             expire_on_commit=False,
         )
         self._repo = DocumentRepository(self._session_factory)
+        self._chunk_repo = ChunkRepository(self._session_factory)
 
         async with self._db_engine.begin() as conn:
             result = await conn.execute(text("SELECT version()"))
@@ -163,6 +169,8 @@ class DocumentWorker:
                     f"{MAX_PAGES} pages (total={result.page_count})"
                 )
 
+            await self._embed_and_store_chunks(event, result.text)
+
             elapsed = (time.monotonic() - t_start) * 1000
             logger.info(
                 f"document_id={document_id} processed successfully "
@@ -185,6 +193,45 @@ class DocumentWorker:
 
         finally:
             self._consumer.commit(message=msg, asynchronous=False)
+
+    async def _embed_and_store_chunks(
+        self, event: DocumentEvent, text: str
+    ) -> None:
+        """
+        Split `text` into overlapping chunks, embed them in one API call,
+        then bulk-insert into document_chunks.
+
+        This runs after mark_ready so a document is always accessible even
+        if embedding fails (e.g. OpenAI is down). The document is readable;
+        it just won't appear in semantic search until chunks are present.
+        """
+        chunks = split_text(text)
+        if not chunks:
+            logger.warning(f"document_id={event.document_id} produced no chunks")
+            return
+
+        logger.info(
+            f"document_id={event.document_id} split into {len(chunks)} chunks"
+        )
+
+        embeddings = await self._embedder.embed_texts(
+            [c.content for c in chunks]
+        )
+
+        chunk_dicts = [
+            {
+                "chunk_index": c.chunk_index,
+                "content": c.content,
+                "embedding": emb,
+            }
+            for c, emb in zip(chunks, embeddings)
+        ]
+
+        await self._chunk_repo.insert_chunks(
+            document_id=event.document_id,
+            channel_id=event.channel_id,
+            chunks=chunk_dicts,
+        )
 
     def _parse_event(self, msg) -> DocumentEvent:
         try:

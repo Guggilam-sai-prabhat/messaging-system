@@ -4,6 +4,8 @@ from .refresh_token import RefreshToken
 from .message import Message
 from .channel import Channel
 from .channel_member import ChannelMember
+from .document import Document
+from .document_chunk import DocumentChunk
 
 __all__ = [
     "Base",
@@ -13,4 +15,6 @@ __all__ = [
     "Message",
     "Channel",
     "ChannelMember",
+    "Document",
+    "DocumentChunk",
 ]
