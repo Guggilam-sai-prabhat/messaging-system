@@ -210,8 +210,11 @@ class DocumentWorker:
             logger.warning(f"document_id={event.document_id} produced no chunks")
             return
 
+        total_words = sum(c.word_count for c in chunks)
+        avg_words = total_words // len(chunks)
         logger.info(
-            f"document_id={event.document_id} split into {len(chunks)} chunks"
+            f"document_id={event.document_id} split into {len(chunks)} chunks "
+            f"avg_words={avg_words} total_words={total_words}"
         )
 
         embeddings = await self._embedder.embed_texts(
