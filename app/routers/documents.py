@@ -7,26 +7,29 @@ GET /documents/{document_id}
 
 Clients poll this endpoint after a successful POST /upload (202)
 to track processing progress. The client should poll until status
-is 'completed' or 'failed', then stop.
+is 'ready', 'embedding_failed', or 'failed', then stop.
 
 ─── Polling contract ─────────────────────────────────────────────
   Recommended client strategy:
     - Poll every 3 seconds for the first 30 seconds
     - Back off to every 10 seconds after that
-    - Stop polling when status = 'completed' or 'failed'
+    - Stop polling when status is 'ready', 'embedding_failed', or 'failed'
     - Surface a user-facing error if status stays 'processing'
       for more than 15 minutes (the reconciliation job runs every
       5 minutes, so 15 minutes means two full recovery cycles have
       passed and something is genuinely wrong)
 
   Status values:
-    'processing' — uploaded, Kafka event emitted (or pending retry),
-                   consumer has not yet finished
-    'completed'  — consumer finished successfully; document is
-                   searchable / available
-    'failed'     — consumer gave up after its own retries; the
-                   document could not be processed (corrupt PDF,
-                   unsupported encoding, etc.)
+    'processing'        — uploaded, Kafka event emitted (or pending retry),
+                          consumer has not yet finished
+    'ready'             — text extracted successfully; document is
+                          readable. Chunks/embeddings may still be in
+                          progress or may have failed (see error_message)
+    'embedding_failed'  — text extraction succeeded but chunking/embedding
+                          did not; document is readable but not searchable
+    'failed'            — consumer gave up after its own retries; the
+                          document could not be processed (corrupt PDF,
+                          unsupported encoding, etc.)
 
 ─── Auth ─────────────────────────────────────────────────────────
   Requires a valid user token (get_current_user). The endpoint
@@ -127,7 +130,7 @@ async def get_document_status(
         "channelId": row.channel_id,
         "fileName": row.file_name,
         "fileSizeBytes": row.file_size_bytes,
-        "status": row.status,           # 'processing' | 'completed' | 'failed'
+        "status": row.status,           # 'processing' | 'ready' | 'embedding_failed' | 'failed'
         "uploadedBy": row.uploaded_by,
         "createdAt": row.created_at.isoformat(),
     }

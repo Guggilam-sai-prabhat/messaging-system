@@ -60,6 +60,9 @@ from sqlalchemy import text
 
 from app.db.database import database
 from app.core.kafka_producer import kafka_producer, KafkaProduceError
+from app.core.redis_client import redis_client
+
+WORKER_HEARTBEAT_KEY = "worker:document_worker:heartbeat"
 
 logger = logging.getLogger("reconciliation")
 
@@ -87,6 +90,22 @@ async def reenqueue_stuck_documents() -> None:
     """
     logger.info("Reconciliation job started — checking for stuck documents")
 
+    # Check worker heartbeat — warn loudly if the worker is down.
+    # The worker sets this key every poll cycle with a 90s TTL.
+    # A missing key means it hasn't run in over 90 seconds.
+    try:
+        heartbeat = await redis_client.redis.get(WORKER_HEARTBEAT_KEY)
+        if heartbeat is None:
+            logger.error(
+                "WORKER DOWN — document_worker heartbeat missing. "
+                "Stuck documents will keep re-enqueuing until the worker is restarted. "
+                "Run: .venv/bin/python -m workers.document_worker"
+            )
+        else:
+            logger.debug("Worker heartbeat OK")
+    except Exception as e:
+        logger.warning(f"Could not check worker heartbeat: {e}")
+
     try:
         async with database.get_session() as session:
             result = await session.execute(
@@ -95,6 +114,7 @@ async def reenqueue_stuck_documents() -> None:
                         document_id,
                         channel_id,
                         storage_path,
+                        file_name,
                         uploaded_by
                     FROM documents
                     WHERE
@@ -128,10 +148,8 @@ async def reenqueue_stuck_documents() -> None:
                     "documentId": document_id,
                     "channelId": row.channel_id,
                     "storagePath": row.storage_path,
+                    "fileName": row.file_name,
                     "uploadedBy": row.uploaded_by,
-                    # Flag so the consumer knows this is a retry and can
-                    # log accordingly. The consumer should still check
-                    # status='completed' before doing any work.
                     "isReconciliation": True,
                 }
             )

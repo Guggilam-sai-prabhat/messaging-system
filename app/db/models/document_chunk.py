@@ -17,7 +17,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
 
-EMBEDDING_DIM = 1536
+EMBEDDING_DIM = 768  # BAAI/bge-base-en-v1.5 (sentence-transformers, free/local)
 
 
 class DocumentChunk(Base):

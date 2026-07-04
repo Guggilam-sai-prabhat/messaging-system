@@ -20,7 +20,7 @@ install: ## Install all dependencies via uv
 	$(UV) sync
 
 dev: ## Run FastAPI with hot-reload
-	$(UVICORN) app.main:app --reload --host 0.0.0.0 --port 8000
+	$(UVICORN) app.main:app --reload --host 0.0.0.0 --port 8002
 
 # ── Database migrations ───────────────────────────────────────────────────────
 migrate: ## Apply all pending Alembic migrations

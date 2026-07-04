@@ -14,7 +14,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
 
 
-VALID_DOC_STATUSES = {"processing", "ready", "failed"}
+VALID_DOC_STATUSES = {"processing", "ready", "embedding_failed", "failed"}
 
 
 class Document(Base):
@@ -82,12 +82,12 @@ class Document(Base):
         nullable=False,
         default="processing",
         server_default="processing",
-        comment="processing → ready | failed",
+        comment="processing → ready → embedding_failed | processing → failed",
     )
     error_message: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
-        comment="Why processing failed, if status = 'failed'.",
+        comment="Why processing/embedding failed, if status = 'failed' or 'embedding_failed'.",
     )
     storage_path: Mapped[str] = mapped_column(
         String(1024),
@@ -140,7 +140,7 @@ class Document(Base):
             postgresql_where=(status != "ready"),
         ),
         CheckConstraint(
-            "status IN ('processing', 'ready', 'failed')",
+            "status IN ('processing', 'ready', 'embedding_failed', 'failed')",
             name="ck_documents_status",
         ),
     )

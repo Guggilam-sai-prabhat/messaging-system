@@ -5,6 +5,7 @@ import signal
 import time
 
 import pypdf
+import redis.asyncio as aioredis
 from confluent_kafka import Consumer, KafkaError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -16,7 +17,11 @@ from workers.config import (
     KAFKA_POLL_TIMEOUT_S,
     KAFKA_TOPIC,
     MAX_PAGES,
+    REDIS_URL,
 )
+
+HEARTBEAT_KEY = "worker:document_worker:heartbeat"
+HEARTBEAT_TTL_S = 90  # key expires if worker stops; reconciliation checks this
 from workers.chunk_repository import ChunkRepository
 from workers.chunker import split_text
 from workers.embedder import Embedder
@@ -42,12 +47,14 @@ class DocumentWorker:
     We use enable.auto.commit = False. The offset is committed in the
     finally block AFTER processing completes (success or failure).
     This means:
-      - success       → status=ready,  offset committed
-      - handled error → status=failed, offset committed
-      - unhandled crash → finally still runs, status=failed, offset committed
+      - success                        → status=ready,            offset committed
+      - error before extraction ready  → status=failed,           offset committed
+      - error during chunking/embedding
+        (extraction already succeeded) → status=embedding_failed, offset committed
+      - unhandled crash → finally still runs, status set per the above, offset committed
 
-    The DB update is idempotent (WHERE status = 'processing'), so
-    redelivery on restart is safe.
+    The DB updates are idempotent (guarded by the expected prior status),
+    so redelivery on restart is safe.
     """
 
     def __init__(self) -> None:
@@ -59,10 +66,12 @@ class DocumentWorker:
         self._running = False
         self._db_engine = None
         self._session_factory: async_sessionmaker
+        self._redis: aioredis.Redis | None = None
 
     async def start(self) -> None:
         await self._init_db()
         self._init_kafka()
+        self._redis = aioredis.from_url(REDIS_URL, decode_responses=True)
         logger.info("DocumentWorker started")
 
     async def _init_db(self) -> None:
@@ -110,6 +119,10 @@ class DocumentWorker:
         if self._consumer:
             self._consumer.close()
             logger.info("Kafka consumer closed")
+        if self._redis:
+            await self._redis.delete(HEARTBEAT_KEY)
+            await self._redis.aclose()
+            logger.info("Redis connection closed")
         if self._db_engine:
             await self._db_engine.dispose()
             logger.info("DB engine disposed")
@@ -124,6 +137,9 @@ class DocumentWorker:
                 self._consumer.poll,
                 KAFKA_POLL_TIMEOUT_S,
             )
+
+            if self._redis:
+                await self._redis.set(HEARTBEAT_KEY, "alive", ex=HEARTBEAT_TTL_S)
 
             if msg is None:
                 continue
@@ -144,6 +160,8 @@ class DocumentWorker:
         t_start = time.monotonic()
         document_id = "unknown"
 
+        reached_ready = False
+
         try:
             event = self._parse_event(msg)
             document_id = event.document_id
@@ -162,6 +180,7 @@ class DocumentWorker:
                 page_count=result.page_count,
                 truncated=result.truncated,
             )
+            reached_ready = True
 
             if result.truncated:
                 logger.warning(
@@ -189,7 +208,12 @@ class DocumentWorker:
                 reason = f"Internal processing error: {type(e).__name__}: {e}"
                 logger.exception(f"document_id={document_id} unexpected error in {elapsed:.0f}ms: {e}")
             if document_id != "unknown":
-                await self._repo.mark_failed(document_id, reason)
+                if reached_ready:
+                    # Text extraction already succeeded and status is 'ready';
+                    # this failure is in chunking/embedding, not extraction.
+                    await self._repo.mark_embedding_failed(document_id, reason)
+                else:
+                    await self._repo.mark_failed(document_id, reason)
 
         finally:
             self._consumer.commit(message=msg, asynchronous=False)
@@ -202,8 +226,9 @@ class DocumentWorker:
         then bulk-insert into document_chunks.
 
         This runs after mark_ready so a document is always accessible even
-        if embedding fails (e.g. OpenAI is down). The document is readable;
-        it just won't appear in semantic search until chunks are present.
+        if embedding fails (e.g. the model fails to load). If it raises,
+        the caller marks the document status='embedding_failed' — it stays
+        readable but won't appear in semantic search until reprocessed.
         """
         chunks = split_text(text)
         if not chunks:
@@ -297,8 +322,8 @@ async def main() -> None:
     await worker.shutdown()
     worker_task.cancel()
     try:
-        await worker_task
-    except asyncio.CancelledError:
+        await asyncio.wait_for(worker_task, timeout=10.0)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
 
     logger.info("Worker stopped cleanly")

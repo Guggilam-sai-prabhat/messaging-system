@@ -1,3 +1,4 @@
+import urllib3
 from minio import Minio
 from minio.error import S3Error
 
@@ -14,11 +15,16 @@ class StorageClient:
     """Thin synchronous wrapper around MinIO used by the worker."""
 
     def __init__(self) -> None:
+        http_client = urllib3.PoolManager(
+            retries=urllib3.Retry(total=1, connect=1, read=1),
+            timeout=urllib3.Timeout(connect=5, read=30),
+        )
         self._client = Minio(
             endpoint=MINIO_ENDPOINT,
             access_key=MINIO_ACCESS_KEY,
             secret_key=MINIO_SECRET_KEY,
             secure=MINIO_USE_SSL,
+            http_client=http_client,
         )
 
     def get_object_bytes(self, object_key: str) -> bytes:

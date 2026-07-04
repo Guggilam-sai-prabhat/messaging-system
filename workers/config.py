@@ -10,9 +10,11 @@ DATABASE_URL = os.getenv(
     "postgresql://postgres:new_password@localhost:5432/messaging",
 )
 
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+REDIS_URL = os.getenv("REDIS_URL", "redis://:redis@localhost:6379/0")
+
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:19000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "documents")
 MINIO_USE_SSL = os.getenv("MINIO_USE_SSL", "false").lower() == "true"
 

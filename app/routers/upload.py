@@ -95,14 +95,16 @@ async def _check_membership(channel_id: str, user_id: str) -> None:
 
 
 def _validate_content_type(upload: UploadFile) -> None:
-    """Check declared MIME type. Belt — the magic byte check is suspenders."""
+    """Check declared MIME type. Belt — the magic byte check is suspenders.
+
+    Some clients (browsers, Swagger UI) send application/octet-stream even
+    for valid PDFs. We warn but don't reject here; _validate_pdf_magic is
+    the authoritative gate.
+    """
     if upload.content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail={
-                "error": "INVALID_FILE_TYPE",
-                "message": f"Expected application/pdf, got {upload.content_type}.",
-            },
+        logger.warning(
+            f"Upload content_type={upload.content_type!r} is not application/pdf "
+            f"— proceeding to magic byte check."
         )
 
 
@@ -114,7 +116,17 @@ async def _validate_pdf_magic(upload: UploadFile) -> None:
     here. We read 4 bytes, check, then seek back so the storage
     service receives the full file.
     """
-    header = await upload.read(4)
+    # Read directly from the underlying SpooledTemporaryFile.
+    # upload.read() can return multipart framing bytes in some clients
+    # (e.g. Swagger UI); upload.file is always the raw file payload.
+    upload.file.seek(0)
+    header = upload.file.read(4)
+    upload.file.seek(0)
+
+    logger.debug(
+        f"_validate_pdf_magic: header={header!r} content_type={upload.content_type!r}"
+    )
+
     if len(header) < 4:
         raise HTTPException(
             status_code=400,
@@ -128,11 +140,10 @@ async def _validate_pdf_magic(upload: UploadFile) -> None:
             status_code=415,
             detail={
                 "error": "INVALID_PDF",
-                "message": "File does not appear to be a valid PDF "
-                           "(missing %PDF header).",
+                "message": f"File does not appear to be a valid PDF "
+                           f"(got header {header!r}, expected %PDF).",
             },
         )
-    await upload.seek(0)
 
 
 async def _validate_file_size(upload: UploadFile) -> None:
@@ -300,6 +311,7 @@ async def upload_document(
                 "documentId": document_id,
                 "channelId": channel_id,
                 "storagePath": object_key,
+                "fileName": sanitized_name,
                 "uploadedBy": user_id,
             }
         )

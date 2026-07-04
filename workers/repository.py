@@ -64,3 +64,26 @@ class DocumentRepository:
         logger.warning(
             f"document_id={document_id} → failed | reason={short_reason}"
         )
+
+    async def mark_embedding_failed(self, document_id: str, reason: str) -> None:
+        """Text extraction already succeeded (status='ready'); embedding/chunking
+        did not. The document stays readable but has no searchable chunks."""
+        short_reason = reason[:500]
+        async with self._session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    text(
+                        """
+                        UPDATE documents
+                        SET
+                            status        = 'embedding_failed',
+                            error_message = :reason
+                        WHERE document_id = :doc_id
+                          AND status      = 'ready'
+                        """
+                    ),
+                    {"doc_id": document_id, "reason": short_reason},
+                )
+        logger.warning(
+            f"document_id={document_id} → embedding_failed | reason={short_reason}"
+        )
