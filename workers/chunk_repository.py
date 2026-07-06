@@ -66,7 +66,8 @@ class ChunkRepository:
         channel_id: str,
         query_embedding: list[float],
         limit: int = 10,
-        min_score: float = 0.0,
+        min_score: float = 0.6,
+        max_per_document: int | None = 3,
     ) -> list[dict]:
         """
         Return up to `limit` chunks in `channel_id` closest to `query_embedding`.
@@ -78,14 +79,25 @@ class ChunkRepository:
         the HNSW index is consulted, so the ANN search only touches this
         channel's vectors.
 
+        min_score=0.6 is an empirical starting threshold for
+        BAAI/bge-base-en-v1.5 — below this, matches tend to be topically
+        adjacent rather than actually relevant. Retune against real query
+        traffic once you have some.
+
+        max_per_document caps how many chunks any single document_id can
+        contribute, so one document with several near-duplicate paragraphs
+        (or duplicate content pasted across documents' chunks) doesn't crowd
+        out the rest of the top-k. Over-fetches from the DB (limit * 4) so
+        capping still leaves enough candidates to fill `limit` slots.
+
         Results are ordered by ascending distance (most similar first).
         """
-        from pgvector.sqlalchemy import cosine_distance
-
         query_vec = query_embedding  # list[float] — pgvector accepts this natively
 
-        score_col = (1 - cosine_distance(DocumentChunk.embedding, query_vec)).label("score")
-        distance_col = cosine_distance(DocumentChunk.embedding, query_vec)
+        distance_col = DocumentChunk.embedding.cosine_distance(query_vec)
+        score_col = (1 - distance_col).label("score")
+
+        fetch_limit = limit * 4 if max_per_document else limit
 
         stmt = (
             select(
@@ -99,14 +111,28 @@ class ChunkRepository:
             .where(DocumentChunk.embedding.is_not(None))
             .where(score_col >= min_score)
             .order_by(distance_col.asc())
-            .limit(limit)
+            .limit(fetch_limit)
         )
 
         async with self._session_factory() as session:
             result = await session.execute(stmt)
             rows = result.mappings().all()
 
-        return [dict(row) for row in rows]
+        if not max_per_document:
+            return [dict(row) for row in rows][:limit]
+
+        per_doc_count: dict[str, int] = {}
+        capped: list[dict] = []
+        for row in rows:
+            doc_id = row["document_id"]
+            if per_doc_count.get(doc_id, 0) >= max_per_document:
+                continue
+            per_doc_count[doc_id] = per_doc_count.get(doc_id, 0) + 1
+            capped.append(dict(row))
+            if len(capped) == limit:
+                break
+
+        return capped
 
     # ── Utility ───────────────────────────────────────────────────────────────
 
