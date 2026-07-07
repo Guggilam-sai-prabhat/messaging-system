@@ -14,6 +14,16 @@ class DocumentRepository:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
+    async def get_status(self, document_id: str) -> str | None:
+        """Current status of a document, or None if the row doesn't exist."""
+        async with self._session_factory() as session:
+            result = await session.execute(
+                text("SELECT status FROM documents WHERE document_id = :doc_id"),
+                {"doc_id": document_id},
+            )
+            row = result.first()
+            return row[0] if row else None
+
     async def mark_ready(
         self,
         document_id: str,

@@ -166,6 +166,23 @@ class DocumentWorker:
             event = self._parse_event(msg)
             document_id = event.document_id
 
+            # Duplicate delivery guard: the producer's retry loop can publish
+            # more than one distinct message for the same upload if a
+            # delivery-confirmation timeout fires after the broker already
+            # persisted the first attempt. document_id is stable across those
+            # duplicates. 'ready' and 'failed' are terminal — a prior delivery
+            # already finished the work, so skip re-running extraction and
+            # embedding. 'embedding_failed' is NOT terminal: extraction
+            # succeeded but chunking/embedding didn't, and there's no other
+            # retry path for it yet, so let a redelivery attempt it again.
+            status = await self._repo.get_status(document_id)
+            if status in ("ready", "failed"):
+                logger.info(
+                    f"document_id={document_id} already status={status} — "
+                    f"skipping duplicate delivery"
+                )
+                return
+
             logger.info(
                 f"Processing document_id={document_id} "
                 f"file={event.file_name} "
