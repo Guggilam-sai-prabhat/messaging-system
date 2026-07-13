@@ -16,6 +16,7 @@ class ChatMessageEvent:
     sender_id: str
     content: str
     timestamp: float
+    reply_to_message_id: str | None = None
 
     @classmethod
     def from_kafka_dict(cls, payload: dict) -> "ChatMessageEvent":
@@ -26,4 +27,5 @@ class ChatMessageEvent:
             sender_id=payload["senderId"],
             content=payload["content"],
             timestamp=payload["timestamp"],
+            reply_to_message_id=payload.get("replyToMessageId"),
         )

@@ -70,6 +70,14 @@ class EnrichedMessage(BaseModel):
         default=None,
         description="Echoed from IncomingMessage for dedup",
     )
+    reply_to_message_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "messageId of the message this one is replying to. Set by the "
+            "AI service when publishing a generated answer back onto "
+            "channel-messages; absent for ordinary user messages."
+        ),
+    )
 
     def to_kafka_dict(self) -> dict:
         """Kafka payload with camelCase keys."""
@@ -83,4 +91,6 @@ class EnrichedMessage(BaseModel):
         }
         if self.client_request_id:
             d["clientRequestId"] = self.client_request_id
+        if self.reply_to_message_id:
+            d["replyToMessageId"] = self.reply_to_message_id
         return d

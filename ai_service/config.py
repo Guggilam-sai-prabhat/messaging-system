@@ -18,9 +18,15 @@ SYSTEM_SENDER_IDS = frozenset(
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_GROUP_ID = os.getenv("AI_KAFKA_GROUP_ID", "ai-service-group")
+KAFKA_POLL_TIMEOUT_S = 1.0
 
 # Same topic app/core/kafka_producer.py publishes chat messages to.
 MESSAGES_TOPIC = "channel-messages"
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:new_password@localhost:5432/messaging",
+)
 
 # ── RAG / retrieval-augmented generation ────────────────────────────────────
 

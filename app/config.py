@@ -40,7 +40,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://:redis@localhost:6379/0"
     dedup_ttl_seconds: int = 300
     database_url: str = "postgresql://postgres:new_password@localhost:5432/messaging"
-    model_config = {"env_file": ".env"}
+    # extra="ignore": .env is shared with ai_service/config.py (e.g.
+    # NVIDIA_*), which reads its own vars via plain os.getenv rather than
+    # this Settings model — those keys aren't fields here and shouldn't
+    # fail startup just because another module's config lives in the same file.
+    model_config = {"env_file": ".env", "extra": "ignore"}
 
     # ── MinIO / S3 ────────────────────────────────────────────
     minio_endpoint: str = "localhost:9000"
