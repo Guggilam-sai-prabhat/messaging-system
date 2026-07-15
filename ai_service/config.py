@@ -68,3 +68,12 @@ RETRIEVAL_MAX_PER_DOCUMENT = int(os.getenv("RETRIEVAL_MAX_PER_DOCUMENT", "3"))
 RETRIEVAL_CONTEXT_CHAR_BUDGET = int(
     os.getenv("RETRIEVAL_CONTEXT_CHAR_BUDGET", "16000")
 )
+
+# ── Reply dedup ──────────────────────────────────────────────────────────────
+
+# TTL for the Redis SET NX claim key in ai_service/rag/reply_dedup.py. Covers
+# the window a redelivered/reprocessed trigger message could plausibly show
+# up in (rebalance, consumer crash-restart) — long enough to catch those,
+# short enough not to permanently block a user re-asking the same question
+# verbatim after this window passes.
+AI_REPLY_DEDUP_TTL_SECONDS = int(os.getenv("AI_REPLY_DEDUP_TTL_SECONDS", "600"))

@@ -63,6 +63,9 @@ async def test_handle_message_generates_and_publishes_on_trigger(monkeypatch):
 
     publish_mock = AsyncMock(return_value={"offset": 1})
     monkeypatch.setattr("ai_service.consumer.publish_answer", publish_mock)
+    monkeypatch.setattr(
+        "ai_service.consumer.reply_dedup_service.try_claim", AsyncMock(return_value=True)
+    )
 
     msg = make_kafka_msg(make_payload(content="/ask what is chapter 3 about?"))
     await consumer._handle_message(msg)
@@ -82,6 +85,9 @@ async def test_handle_message_swallows_publish_failure(monkeypatch):
 
     publish_mock = AsyncMock(side_effect=AnswerPublishError("kafka down"))
     monkeypatch.setattr("ai_service.consumer.publish_answer", publish_mock)
+    monkeypatch.setattr(
+        "ai_service.consumer.reply_dedup_service.try_claim", AsyncMock(return_value=True)
+    )
 
     msg = make_kafka_msg(make_payload(content="/ask anything?"))
 
@@ -90,6 +96,26 @@ async def test_handle_message_swallows_publish_failure(monkeypatch):
     await consumer._handle_message(msg)
 
     publish_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_handle_message_skips_publish_when_already_answered(monkeypatch):
+    consumer = make_consumer_stub()
+    consumer._generator.answer.return_value = RagAnswer(text="the answer", sources_used=[])
+
+    publish_mock = AsyncMock(return_value={"offset": 1})
+    monkeypatch.setattr("ai_service.consumer.publish_answer", publish_mock)
+    monkeypatch.setattr(
+        "ai_service.consumer.reply_dedup_service.try_claim", AsyncMock(return_value=False)
+    )
+
+    msg = make_kafka_msg(make_payload(content="/ask anything?"))
+    await consumer._handle_message(msg)
+
+    # Generation still runs (dedup is checked after generation), but a
+    # duplicate publish must not happen.
+    consumer._generator.answer.assert_awaited_once()
+    publish_mock.assert_not_called()
 
 
 @pytest.mark.asyncio

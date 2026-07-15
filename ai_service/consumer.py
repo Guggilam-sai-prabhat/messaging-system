@@ -23,11 +23,20 @@ regardless of outcome:
 Why not skip the commit on failure (like document_worker retries via
 redelivery)? document_worker's failure states are persisted to a `documents`
 row keyed by document_id, so redelivery is idempotent (checked via
-get_status). A chat message has no equivalent "has the AI already answered
-this" row to check, so redelivering after a publish failure risks the model
-generating and (if the broker recovered) publishing a duplicate answer
-instead of no answer — a worse outcome than a single dropped reply, which a
-user can simply ask again.
+get_status). Redelivering an AI trigger after a publish failure would risk
+the model generating and (if the broker recovered) publishing a duplicate
+answer instead of no answer — a worse outcome than a single dropped reply,
+which a user can simply ask again.
+
+Reply dedup
+-----------
+ai_service.rag.reply_dedup.ReplyDedupService gives redelivered/reprocessed
+trigger messages (rebalance, crash-restart) a "has the AI already answered
+this" check via a Redis SET NX claim keyed on the triggering message id,
+checked in _handle_message right before publish. This closes the specific
+gap described above without changing the offset-commit-always policy: a
+message that's already been answered still gets its offset committed, it
+just skips a second publish.
 """
 
 import asyncio
@@ -49,6 +58,8 @@ from ai_service.config import (
 from ai_service.pipeline import MessageParseError, detect, parse_event
 from ai_service.rag.generator import RagGenerator
 from ai_service.rag.publisher import AnswerPublishError, publish_answer
+from ai_service.rag.reply_dedup import reply_dedup_service
+from app.core.redis_client import redis_client
 from workers.chunk_repository import ChunkRepository
 from workers.embedder import Embedder
 
@@ -72,6 +83,7 @@ class AiServiceConsumer:
     async def start(self) -> None:
         await self._init_db()
         self._init_kafka()
+        await redis_client.initialize()
         self._generator = RagGenerator(self._embedder, self._chunk_repo)
         logger.info("AiServiceConsumer started")
 
@@ -108,6 +120,7 @@ class AiServiceConsumer:
         await self._generator.close()
         if self._db_engine:
             await self._db_engine.dispose()
+        await redis_client.close()
 
     async def run(self) -> None:
         self._running = True
@@ -161,6 +174,17 @@ class AiServiceConsumer:
         )
 
         answer = await self._generator.answer(event.channel_id, result.query)
+
+        claimed = await reply_dedup_service.try_claim(event.message_id)
+        if not claimed:
+            # Already answered this trigger message — a crash/redelivery
+            # reprocessed it. Skip publish to avoid a duplicate reply; the
+            # offset commit in run()'s finally still proceeds normally.
+            logger.info(
+                f"channel_id={event.channel_id} messageId={event.message_id} "
+                f"already answered, skipping duplicate publish"
+            )
+            return
 
         try:
             await publish_answer(
