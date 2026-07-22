@@ -14,6 +14,17 @@ import pytest
 from ai_service.consumer import AiServiceConsumer
 from ai_service.rag.generator import RagAnswer
 from ai_service.rag.publisher import AnswerPublishError
+from ai_service.rag.rate_limiter import RateLimitResult
+
+
+@pytest.fixture(autouse=True)
+def allow_rate_limit(monkeypatch):
+    """Default rate_limit_service.check() to "allowed" so existing tests
+    don't need to know about rate limiting; tests that care override this."""
+    monkeypatch.setattr(
+        "ai_service.consumer.rate_limit_service.check",
+        AsyncMock(return_value=RateLimitResult(allowed=True)),
+    )
 
 
 def make_kafka_msg(payload: dict):
@@ -116,6 +127,40 @@ async def test_handle_message_skips_publish_when_already_answered(monkeypatch):
     # duplicate publish must not happen.
     consumer._generator.answer.assert_awaited_once()
     publish_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_message_skips_generation_when_rate_limited(monkeypatch):
+    consumer = make_consumer_stub()
+    monkeypatch.setattr(
+        "ai_service.consumer.rate_limit_service.check",
+        AsyncMock(return_value=RateLimitResult(allowed=False, exceeded_scope="user")),
+    )
+    publish_mock = AsyncMock()
+    monkeypatch.setattr("ai_service.consumer.publish_answer", publish_mock)
+
+    msg = make_kafka_msg(make_payload(content="/ask anything?"))
+    await consumer._handle_message(msg)
+
+    consumer._generator.answer.assert_not_called()
+    publish_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_message_checks_rate_limit_by_sender_and_channel(monkeypatch):
+    consumer = make_consumer_stub()
+    consumer._generator.answer.return_value = RagAnswer(text="the answer", sources_used=[])
+    rate_check = AsyncMock(return_value=RateLimitResult(allowed=True))
+    monkeypatch.setattr("ai_service.consumer.rate_limit_service.check", rate_check)
+    monkeypatch.setattr("ai_service.consumer.publish_answer", AsyncMock(return_value={"offset": 1}))
+    monkeypatch.setattr(
+        "ai_service.consumer.reply_dedup_service.try_claim", AsyncMock(return_value=True)
+    )
+
+    msg = make_kafka_msg(make_payload(sender_id="user-9", channel_id="chan-9", content="/ask x?"))
+    await consumer._handle_message(msg)
+
+    rate_check.assert_awaited_once_with(sender_id="user-9", channel_id="chan-9")
 
 
 @pytest.mark.asyncio

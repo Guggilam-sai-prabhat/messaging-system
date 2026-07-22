@@ -37,6 +37,15 @@ checked in _handle_message right before publish. This closes the specific
 gap described above without changing the offset-commit-always policy: a
 message that's already been answered still gets its offset committed, it
 just skips a second publish.
+
+Rate limiting
+-------------
+ai_service.rag.rate_limiter.RateLimitService caps triggers per sender and
+per channel (Redis fixed-window counters), checked right after trigger
+detection — before embedding, retrieval, or a NIM call, so a rate-limited
+request never spends that cost. A declined request is dropped silently
+(logged, offset still committed), same posture as a dropped reply being
+preferable to noisy output elsewhere in this module.
 """
 
 import asyncio
@@ -58,6 +67,7 @@ from ai_service.config import (
 from ai_service.pipeline import MessageParseError, detect, parse_event
 from ai_service.rag.generator import RagGenerator
 from ai_service.rag.publisher import AnswerPublishError, publish_answer
+from ai_service.rag.rate_limiter import rate_limit_service
 from ai_service.rag.reply_dedup import reply_dedup_service
 from app.core.redis_client import redis_client
 from workers.chunk_repository import ChunkRepository
@@ -172,6 +182,20 @@ class AiServiceConsumer:
             f"channel_id={event.channel_id} messageId={event.message_id} "
             f"triggered, query={result.query[:80]!r}"
         )
+
+        rate_result = await rate_limit_service.check(
+            sender_id=event.sender_id, channel_id=event.channel_id
+        )
+        if not rate_result.allowed:
+            # Declined, not an error: drop silently rather than publish a
+            # "rate limited" reply — same posture as a dropped reply being
+            # preferable to noisy/duplicate output elsewhere in this module.
+            # Offset still commits normally in run()'s finally.
+            logger.info(
+                f"channel_id={event.channel_id} messageId={event.message_id} "
+                f"rate limited (scope={rate_result.exceeded_scope}), dropping"
+            )
+            return
 
         answer = await self._generator.answer(event.channel_id, result.query)
 

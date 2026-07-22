@@ -77,3 +77,15 @@ RETRIEVAL_CONTEXT_CHAR_BUDGET = int(
 # short enough not to permanently block a user re-asking the same question
 # verbatim after this window passes.
 AI_REPLY_DEDUP_TTL_SECONDS = int(os.getenv("AI_REPLY_DEDUP_TTL_SECONDS", "600"))
+
+# ── Rate limiting ────────────────────────────────────────────────────────────
+
+# Fixed-window caps on /ask triggers, checked in ai_service/rag/rate_limiter.py
+# right after trigger detection and before any embed/retrieve/NIM cost is
+# spent. Defaults are deliberately conservative — a real chat user asking the
+# AI 5 questions/minute is already a lot; a channel-wide 20/minute leaves room
+# for several concurrent users without one channel being able to exhaust NIM
+# capacity/budget on its own.
+AI_RATE_LIMIT_USER_MAX = int(os.getenv("AI_RATE_LIMIT_USER_MAX", "5"))
+AI_RATE_LIMIT_CHANNEL_MAX = int(os.getenv("AI_RATE_LIMIT_CHANNEL_MAX", "20"))
+AI_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("AI_RATE_LIMIT_WINDOW_SECONDS", "60"))
