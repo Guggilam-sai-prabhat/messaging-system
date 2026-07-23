@@ -46,6 +46,24 @@ detection — before embedding, retrieval, or a NIM call, so a rate-limited
 request never spends that cost. A declined request is dropped silently
 (logged, offset still committed), same posture as a dropped reply being
 preferable to noisy output elsewhere in this module.
+
+Intra-process concurrency
+--------------------------
+Instead of a fully-serial poll -> handle -> commit loop, the poll loop is a
+single producer that feeds a bounded asyncio.Queue; WORKER_CONCURRENCY
+worker tasks pull messages off that queue and run _handle_message
+concurrently (see docs/ai_service_productionization.md §2). A full queue
+blocks the poll loop's `put`, which is deliberate backpressure — it slows
+Kafka consumption when workers can't keep up instead of spawning unbounded
+in-flight tasks.
+
+Because workers finish out of order, offsets can no longer be committed as
+"whatever just finished" — that risks committing offset N+1 while offset N
+is still in flight, and a crash then skips N's message on redelivery. Each
+partition's OffsetWatermarkTracker (ai_service/offset_tracker.py) tracks the
+lowest still-in-flight offset per partition and only reports a new
+safe-to-commit watermark once the contiguous run of lower offsets has all
+finished; only that watermark is ever committed.
 """
 
 import asyncio
@@ -54,7 +72,7 @@ import logging
 import signal
 import time
 
-from confluent_kafka import Consumer, KafkaError
+from confluent_kafka import Consumer, KafkaError, TopicPartition
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from ai_service.config import (
@@ -63,7 +81,10 @@ from ai_service.config import (
     KAFKA_GROUP_ID,
     KAFKA_POLL_TIMEOUT_S,
     MESSAGES_TOPIC,
+    WORKER_CONCURRENCY,
+    AI_QUEUE_SIZE_MULTIPLIER,
 )
+from ai_service.offset_tracker import OffsetWatermarkTracker
 from ai_service.pipeline import MessageParseError, detect, parse_event
 from ai_service.rag.generator import RagGenerator
 from ai_service.rag.publisher import AnswerPublishError, publish_answer
@@ -89,6 +110,10 @@ class AiServiceConsumer:
         self._generator: RagGenerator
         self._running = False
         self._db_engine = None
+        self._offsets = OffsetWatermarkTracker()
+        self._queue: asyncio.Queue = asyncio.Queue(
+            maxsize=WORKER_CONCURRENCY * AI_QUEUE_SIZE_MULTIPLIER
+        )
 
     async def start(self) -> None:
         await self._init_db()
@@ -136,21 +161,61 @@ class AiServiceConsumer:
         self._running = True
         loop = asyncio.get_running_loop()
 
-        while self._running:
-            msg = await loop.run_in_executor(None, self._consumer.poll, KAFKA_POLL_TIMEOUT_S)
+        workers = [
+            asyncio.create_task(self._worker_loop())
+            for _ in range(WORKER_CONCURRENCY)
+        ]
 
-            if msg is None:
-                continue
+        try:
+            while self._running:
+                msg = await loop.run_in_executor(None, self._consumer.poll, KAFKA_POLL_TIMEOUT_S)
 
-            if msg.error():
-                if msg.error().code() != KafkaError._PARTITION_EOF:
-                    logger.error(f"Kafka consumer error: {msg.error()}")
-                continue
+                if msg is None:
+                    continue
 
+                if msg.error():
+                    if msg.error().code() != KafkaError._PARTITION_EOF:
+                        logger.error(f"Kafka consumer error: {msg.error()}")
+                    continue
+
+                self._offsets.track(msg.partition(), msg.offset())
+                # Backpressure: blocks the poll loop itself when all workers
+                # are busy and the queue is full, rather than piling up
+                # unbounded in-flight tasks.
+                await self._queue.put(msg)
+        finally:
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+    async def _worker_loop(self) -> None:
+        while True:
+            msg = await self._queue.get()
             try:
-                await self._handle_message(msg)
+                try:
+                    await self._handle_message(msg)
+                finally:
+                    self._commit_watermark(msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    f"Unhandled error processing messageId partition={msg.partition()} "
+                    f"offset={msg.offset()}"
+                )
             finally:
-                self._consumer.commit(message=msg, asynchronous=False)
+                self._queue.task_done()
+
+    def _commit_watermark(self, msg) -> None:
+        new_offset = self._offsets.complete(msg.partition(), msg.offset())
+        if new_offset is None:
+            # A lower offset on this partition is still in flight; committing
+            # now would risk skipping it on a future redelivery.
+            return
+        self._consumer.commit(
+            offsets=[TopicPartition(msg.topic(), msg.partition(), new_offset)],
+            asynchronous=False,
+        )
 
     async def _handle_message(self, msg) -> None:
         t_start = time.monotonic()

@@ -89,3 +89,15 @@ AI_REPLY_DEDUP_TTL_SECONDS = int(os.getenv("AI_REPLY_DEDUP_TTL_SECONDS", "600"))
 AI_RATE_LIMIT_USER_MAX = int(os.getenv("AI_RATE_LIMIT_USER_MAX", "5"))
 AI_RATE_LIMIT_CHANNEL_MAX = int(os.getenv("AI_RATE_LIMIT_CHANNEL_MAX", "20"))
 AI_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("AI_RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+# ── Intra-process concurrency ────────────────────────────────────────────────
+
+# Number of worker tasks consuming from the internal bounded queue in
+# ai_service/consumer.py, replacing the previous fully-serial
+# poll -> handle -> commit loop. See docs/ai_service_productionization.md §2.
+WORKER_CONCURRENCY = int(os.getenv("AI_WORKER_CONCURRENCY", "4"))
+
+# Bounded queue size the poll loop feeds workers through. Sized as a small
+# multiple of WORKER_CONCURRENCY so there's a little buffering without an
+# unbounded backlog; a full queue backpressures the poll loop itself.
+AI_QUEUE_SIZE_MULTIPLIER = int(os.getenv("AI_QUEUE_SIZE_MULTIPLIER", "2"))
