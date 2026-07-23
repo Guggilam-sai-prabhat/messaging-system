@@ -14,6 +14,8 @@ ChunkRepository instances the document worker already uses.
 
 import logging
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from ai_service.config import (
     RETRIEVAL_MAX_PER_DOCUMENT,
     RETRIEVAL_MIN_SCORE,
@@ -25,6 +27,13 @@ from workers.chunk_repository import ChunkRepository
 from workers.embedder import Embedder
 
 logger = logging.getLogger("ai_service.rag")
+
+# Returned when pgvector/Postgres retrieval itself fails (connection down,
+# query error) — distinct from a successful search that just finds nothing,
+# which still proceeds to the LLM so it can phrase its own "no info" answer.
+RETRIEVAL_UNAVAILABLE_MESSAGE = (
+    "Sorry, I'm unable to look up context right now — please try again shortly."
+)
 
 # Returned verbatim when the LLM call itself fails (not when retrieval finds
 # nothing — that case still calls the LLM so it can phrase the "insufficient
@@ -71,20 +80,28 @@ class RagGenerator:
 
         Never raises for "no results found" — that's a normal outcome
         surfaced through the LLM's own "insufficient information" phrasing.
-        Only raises-turned-degraded-response on actual infra failure (NVIDIA
-        API down, malformed response) — the caller gets a RagAnswer with
-        had_error=True rather than an exception, so a single failed request
-        can't crash the consumer loop.
+        Only raises-turned-degraded-response on actual infra failure
+        (pgvector/Postgres down, NVIDIA API down, malformed response) — the
+        caller gets a RagAnswer with had_error=True rather than an exception,
+        so a single failed request can't crash the consumer loop.
         """
         query_embedding = await self._embedder.embed_query(query)
 
-        rows = await self._chunk_repository.semantic_search(
-            channel_id=channel_id,
-            query_embedding=query_embedding,
-            limit=RETRIEVAL_TOP_K,
-            min_score=RETRIEVAL_MIN_SCORE,
-            max_per_document=RETRIEVAL_MAX_PER_DOCUMENT,
-        )
+        try:
+            rows = await self._chunk_repository.semantic_search(
+                channel_id=channel_id,
+                query_embedding=query_embedding,
+                limit=RETRIEVAL_TOP_K,
+                min_score=RETRIEVAL_MIN_SCORE,
+                max_per_document=RETRIEVAL_MAX_PER_DOCUMENT,
+            )
+        except SQLAlchemyError as e:
+            logger.error(f"channel_id={channel_id} retrieval failed: {e}")
+            return RagAnswer(
+                text=RETRIEVAL_UNAVAILABLE_MESSAGE,
+                sources_used=[],
+                had_error=True,
+            )
 
         chunks = [
             RetrievedChunk(
